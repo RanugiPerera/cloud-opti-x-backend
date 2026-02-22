@@ -227,16 +227,16 @@ class CostForecaster:
         self.model.load_state_dict(torch.load(path, map_location=self.device))
         print(f"Model loaded from {path}")
 
-    def predict(self, historical_data, forecast_days=7):
+    def predict(self, historical_data, forecast_hours=7):
         """
         Make predictions
 
         Args:
             historical_data: numpy array of shape (batch, seq_len, features)
-            forecast_days: number of days to forecast
+            forecast_hours: number of hours to forecast
 
         Returns:
-            predictions: numpy array of shape (batch, forecast_days)
+            predictions: numpy array of shape (batch, forecast_hours)
         """
         self.model.eval()
 
@@ -244,7 +244,7 @@ class CostForecaster:
         src = torch.FloatTensor(historical_data).to(self.device)
 
         # predict
-        predictions = self.model.predict(src, forecast_days)
+        predictions = self.model.predict(src, forecast_hours)
 
         # convert back to numpy
         return predictions.cpu().numpy()
