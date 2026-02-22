@@ -72,7 +72,7 @@ class Config:
     # ==========================================
     # Training Parameters
     # ==========================================
-    SEQUENCE_LENGTH = 24  # hours of historical data
+    SEQUENCE_LENGTH = 168  # hours of historical data
     FORECAST_LENGTH = 24  # hours to predict
     BATCH_SIZE = 32
     EPOCHS = 50

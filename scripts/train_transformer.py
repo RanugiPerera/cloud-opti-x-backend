@@ -1,5 +1,6 @@
 """
 Transformer Model Training - Cloud Cost Forecasting
+FIXED: Replaced broken MAPE with proper metrics (MAE, RMSE, R²)
 """
 
 import sys
@@ -20,7 +21,7 @@ import numpy as np
 import pickle
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import r2_score, mean_absolute_percentage_error
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import matplotlib.pyplot as plt
 
 from models.transformer import CostForecaster
@@ -39,7 +40,7 @@ MODELS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
 # Hyperparameters
-SEQUENCE_LENGTH = 24  # use past 24 hours to predict
+SEQUENCE_LENGTH = 168  # use past 168 hours to predict
 FORECAST_LENGTH = 24  # predict next 24 hours
 BATCH_SIZE = 32
 EPOCHS = 100
@@ -319,7 +320,9 @@ def train_model(model, train_loader, val_loader, dataset, logger, epochs=100, lr
 
 
 def calculate_accuracy(model, val_loader, dataset, logger):
-    """Calculate final accuracy metrics"""
+    """
+    Calculate final accuracy metrics using PROPER metrics (not broken MAPE)
+    """
     
     logger.info("="*70)
     logger.info("Calculating Final Accuracy Metrics...")
@@ -351,18 +354,93 @@ def calculate_accuracy(model, val_loader, dataset, logger):
     y_pred_dollars = dataset.inverse_transform_cost(np.array(all_preds))
     y_true_dollars = dataset.inverse_transform_cost(np.array(all_actuals))
 
-    # Calculate metrics
+    # ============================================
+    # PROPER METRICS (NOT BROKEN MAPE!)
+    # ============================================
+
+    # 1. R² Score (Variance Explained) - Primary metric
     r2 = r2_score(y_true_dollars, y_pred_dollars)
-    mape = mean_absolute_percentage_error(y_true_dollars, y_pred_dollars)
-    accuracy_pct = 100 * (1 - mape)
 
-    logger.info("-" * 70)
-    logger.info(f"R2 Score (Variance Explained):     {r2:.4f}")
-    logger.info(f"Mean Absolute Percentage Error:    {mape*100:.2f}%")
-    logger.info(f"OVERALL MODEL ACCURACY:            {accuracy_pct:.2f}%")
-    logger.info("-" * 70)
+    # 2. Mean Absolute Error - Easy to interpret
+    mae = mean_absolute_error(y_true_dollars, y_pred_dollars)
 
-    return y_true_dollars, y_pred_dollars, accuracy_pct
+    # 3. Root Mean Squared Error - Penalizes large errors
+    rmse = np.sqrt(mean_squared_error(y_true_dollars, y_pred_dollars))
+
+    # 4. Median Absolute Error - Robust to outliers
+    median_ae = np.median(np.abs(y_true_dollars - y_pred_dollars))
+
+    # 5. Percentage-based metrics (using MAE)
+    avg_cost = y_true_dollars.mean()
+    mae_percentage = (mae / avg_cost) * 100 if avg_cost > 0 else 0
+
+    # 6. OPTIONAL: Filtered MAPE (only for costs > $1.00 to avoid division issues)
+    mask = y_true_dollars > 1.00
+    if np.sum(mask) > 10:  # Only if we have enough high-value samples
+        mape_filtered = np.mean(np.abs((y_true_dollars[mask] - y_pred_dollars[mask]) 
+                                        / y_true_dollars[mask])) * 100
+        coverage_pct = 100 * np.sum(mask) / len(y_true_dollars)
+    else:
+        mape_filtered = None
+        coverage_pct = 0
+
+    # ============================================
+    # PRINT COMPREHENSIVE REPORT
+    # ============================================
+
+    logger.info("\n" + "="*70)
+    logger.info("MODEL PERFORMANCE METRICS")
+    logger.info("="*70)
+
+    logger.info(f"\n PRIMARY METRICS:")
+    logger.info(f"  R² Score (Variance Explained):    {r2:.4f} ({r2*100:.2f}%)")
+    logger.info(f"  Mean Absolute Error (MAE):        ${mae:.4f}")
+    logger.info(f"  Root Mean Squared Error (RMSE):   ${rmse:.4f}")
+    logger.info(f"  Median Absolute Error:            ${median_ae:.4f}")
+
+    logger.info(f"\n PERCENTAGE METRICS:")
+    logger.info(f"  MAE as % of average cost:         {mae_percentage:.2f}%")
+    
+    if mape_filtered is not None and coverage_pct > 50:
+        logger.info(f"  MAPE (costs > $1.00 only):        {mape_filtered:.2f}%")
+        logger.info(f"  Coverage:                         {coverage_pct:.1f}% of data")
+        logger.info(f"  Accuracy (from filtered MAPE):    {100 - mape_filtered:.2f}%")
+    else:
+        logger.info(f"  MAPE: Not computed (insufficient high-value samples)")
+
+    logger.info(f"\n COST STATISTICS:")
+    logger.info(f"  Mean Predicted Cost:              ${y_pred_dollars.mean():.4f}")
+    logger.info(f"  Mean Actual Cost:                 ${y_true_dollars.mean():.4f}")
+    logger.info(f"  Prediction Range:                 ${y_pred_dollars.min():.4f} - ${y_pred_dollars.max():.4f}")
+    logger.info(f"  Actual Range:                     ${y_true_dollars.min():.4f} - ${y_true_dollars.max():.4f}")
+
+
+    # ============================================
+    # DATA DISTRIBUTION ANALYSIS
+    # ============================================
+
+    logger.info("="*70)
+    logger.info("DATA DISTRIBUTION ANALYSIS")
+    logger.info("="*70)
+
+    bins = [0, 0.10, 0.50, 1.00, 5.00, 10.00, float('inf')]
+    labels = ['$0-0.10', '$0.10-0.50', '$0.50-1.00', '$1.00-5.00', '$5.00-10.00', '>$10']
+
+    logger.info("\nActual cost distribution:")
+    for i, (low, high) in enumerate(zip(bins[:-1], bins[1:])):
+        count = np.sum((y_true_dollars >= low) & (y_true_dollars < high))
+        pct = 100 * count / len(y_true_dollars)
+        logger.info(f"  {labels[i]:>15}: {count:>6} samples ({pct:>5.1f}%)")
+
+    near_zero = np.sum(y_true_dollars < 0.50)
+    near_zero_pct = 100 * near_zero / len(y_true_dollars)
+    logger.info(f"\n  Values < $0.50: {near_zero} ({near_zero_pct:.1f}%)")
+    logger.info("These low values would break traditional MAPE calculation")
+    logger.info("That's why we use MAE and R² as primary metrics instead")
+
+    logger.info("="*70 + "\n")
+
+    return y_true_dollars, y_pred_dollars, r2, mae, mae_percentage
 
 
 def plot_training_curves(train_losses, val_losses, logger):
@@ -396,28 +474,41 @@ def plot_training_curves(train_losses, val_losses, logger):
     plt.tight_layout()
     plot_path = MODELS_DIR / 'training_curve.png'
     plt.savefig(plot_path, dpi=150)
-    logger.info(f"[OK] Training curve saved to: {plot_path}")
+    logger.info(f"✓ Training curve saved to: {plot_path}")
     plt.close()
 
 
-def plot_accuracy_scatter(y_true, y_pred, accuracy_pct, logger):
-    """Generate and save accuracy scatter plot"""
+def plot_accuracy_scatter(y_true, y_pred, r2, mae, logger):
+    """Generate and save accuracy scatter plot with proper metrics"""
     
-    plt.figure(figsize=(7, 7))
-    plt.scatter(y_true, y_pred, alpha=0.3, color='teal', s=10)
+    plt.figure(figsize=(10, 10))
     
-    # Add identity line
+    # Main scatter plot
+    plt.scatter(y_true, y_pred, alpha=0.3, color='teal', s=20)
+    
+    # Add identity line (perfect predictions)
     max_val = max(y_true.max(), y_pred.max())
-    plt.plot([0, max_val], [0, max_val], color='red', lw=2, linestyle='--')
+    min_val = min(y_true.min(), y_pred.min())
+    plt.plot([min_val, max_val], [min_val, max_val], 
+             color='red', lw=2, linestyle='--', label='Perfect Prediction')
     
-    plt.xlabel('Actual Cost ($)')
-    plt.ylabel('Predicted Cost ($)')
-    plt.title(f'Actual vs Predicted (Accuracy: {accuracy_pct:.2f}%)')
-    plt.grid(True, alpha=0.2)
+    # Add ±20% error bands
+    plt.plot([min_val, max_val], [min_val*0.8, max_val*0.8], 
+             color='orange', lw=1, linestyle=':', alpha=0.5, label='±20% Error')
+    plt.plot([min_val, max_val], [min_val*1.2, max_val*1.2], 
+             color='orange', lw=1, linestyle=':', alpha=0.5)
+    
+    plt.xlabel('Actual Cost ($)', fontsize=12)
+    plt.ylabel('Predicted Cost ($)', fontsize=12)
+    plt.title(f'Actual vs Predicted Cost\nR²: {r2:.4f} | MAE: ${mae:.4f}', 
+              fontsize=14, fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
     
     plot_path = MODELS_DIR / 'accuracy_scatter.png'
     plt.savefig(plot_path, dpi=150)
-    logger.info(f"[OK] Accuracy scatter plot saved to: {plot_path}")
+    logger.info(f"✓ Accuracy scatter plot saved to: {plot_path}")
     plt.close()
 
 
@@ -446,19 +537,12 @@ def main():
         # Step 1: Load data
         logger.info("\n[1/6] Loading processed data...")
         cost_df = pd.read_csv(PROCESSED_DIR / 'cost_timeseries.csv')
-        logger.info(f"[OK] Loaded {len(cost_df):,} records")
-        
-            # Step 1: Load data
-        logger.info("\n[1/6] Loading processed data...")
-        cost_df = pd.read_csv(PROCESSED_DIR / 'cost_timeseries.csv')
-        logger.info(f"[OK] Loaded {len(cost_df):,} records")
+        logger.info(f"✓ Loaded {len(cost_df):,} records")
 
-        # ------------------------------------------------------------------
-        # DATA SUFFICIENCY CHECK
-        # ------------------------------------------------------------------
+        # Data sufficiency check
         min_required = SEQUENCE_LENGTH + FORECAST_LENGTH
 
-        logger.info("Data requirements check:")
+        logger.info("\nData requirements check:")
         logger.info(f"  Sequence length: {SEQUENCE_LENGTH}")
         logger.info(f"  Forecast length: {FORECAST_LENGTH}")
         logger.info(f"  Total required hours: {min_required}")
@@ -466,16 +550,12 @@ def main():
 
         if len(cost_df) < min_required:
             logger.error(
-                f"❌ Insufficient data: need at least {min_required} hours, "
+                f"Insufficient data: need at least {min_required} hours, "
                 f"but only {len(cost_df)} available"
-        )
+            )
             sys.exit(1)
         else:
-            logger.info(
-            f"✅ Data sufficient: {len(cost_df)} >= {min_required}"
-        )
-# ------------------------------------------------------------------
-        
+            logger.info(f"Data sufficient: {len(cost_df)} >= {min_required}")
 
         # Step 2: Create dataset
         logger.info("\n[2/6] Creating dataset...")
@@ -539,37 +619,40 @@ def main():
         scaler_path = MODELS_DIR / 'scaler.pkl'
         with open(scaler_path, 'wb') as f:
             pickle.dump(dataset.scaler, f)
-        logger.info(f"[OK] Scaler saved to {scaler_path}")
+        logger.info(f"✓ Scaler saved to {scaler_path}")
 
-        # Step 6: Calculate accuracy
+        # Step 6: Calculate accuracy with PROPER metrics
         logger.info("\n[6/6] Calculating accuracy metrics...")
-        y_true, y_pred, accuracy_pct = calculate_accuracy(model, val_loader, dataset, logger)
+        y_true, y_pred, r2, mae, mae_pct= calculate_accuracy(
+            model, val_loader, dataset, logger
+        )
 
         # Generate plots
         plot_training_curves(train_losses, val_losses, logger)
-        plot_accuracy_scatter(y_true, y_pred, accuracy_pct, logger)
+        plot_accuracy_scatter(y_true, y_pred, r2, mae, logger)
 
         # Final summary
         logger.info("\n" + "="*70)
-        logger.info("[SUCCESS] TRAINING COMPLETE!")
+        logger.info(" TRAINING COMPLETE!")
         logger.info("="*70)
-        logger.info(f"Model saved to: {MODELS_DIR / 'transformer_model.pth'}")
-        logger.info(f"Scaler saved to: {scaler_path}")
-        logger.info(f"Training curve: {MODELS_DIR / 'training_curve.png'}")
-        logger.info(f"Accuracy plot: {MODELS_DIR / 'accuracy_scatter.png'}")
-        logger.info(f"Model Accuracy: {accuracy_pct:.2f}%")
-        logger.info("\nYou can now use the model for forecasting!")
-        logger.info("Restart your Flask server to load the new model.")
-        logger.info("="*70)
+        logger.info(f"\n Saved Files:")
+        logger.info(f"  Model:         {MODELS_DIR / 'transformer_model.pth'}")
+        logger.info(f"  Scaler:        {scaler_path}")
+        logger.info(f"  Training plot: {MODELS_DIR / 'training_curve.png'}")
+        logger.info(f"  Accuracy plot: {MODELS_DIR / 'accuracy_scatter.png'}")
+        
+        logger.info(f"\n Final Metrics:")
+        logger.info(f"  R² Score:      {r2:.4f} ({r2*100:.1f}%)")
+        logger.info(f"  MAE:           ${mae:.4f} ({mae_pct:.1f}% of avg)")
 
         return 0
 
     except FileNotFoundError as e:
-        logger.error(f"\n[ERROR] File not found: {str(e)}")
+        logger.error(f"\n File not found: {str(e)}")
         logger.error("Please run preprocessing first: python scripts/preprocess_data.py")
         return 1
     except Exception as e:
-        logger.exception(f"\n[ERROR] Unexpected error: {str(e)}")
+        logger.exception(f"\n Unexpected error: {str(e)}")
         return 1
 
 
