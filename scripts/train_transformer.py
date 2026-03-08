@@ -1,14 +1,8 @@
-"""
-Transformer Model Training - Cloud Cost Forecasting
-FIXED: Replaced broken MAPE with proper metrics (MAE, RMSE, R²)
-"""
-
 import sys
 from pathlib import Path
 import logging
 from datetime import datetime
 
-# Add parent directory to path
 BASE_DIR = Path(__file__).parent.parent
 sys.path.append(str(BASE_DIR))
 
@@ -19,141 +13,127 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
 import pickle
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from models.transformer import CostForecaster
 
-# ============================================================================
+# =============================================================================
 # CONFIGURATION
-# ============================================================================
+# =============================================================================
 
-# Directories
 PROCESSED_DIR = BASE_DIR / 'data' / 'processed'
-MODELS_DIR = BASE_DIR / 'trained_models'
-LOGS_DIR = BASE_DIR / 'logs'
+MODELS_DIR    = BASE_DIR / 'trained_models'
+LOGS_DIR      = BASE_DIR / 'logs'
 
-# Create directories
 MODELS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
-# Hyperparameters
-SEQUENCE_LENGTH = 168  # use past 168 hours to predict
-FORECAST_LENGTH = 24  # predict next 24 hours
-BATCH_SIZE = 32
-EPOCHS = 100
-LEARNING_RATE = 0.0005
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+SEQUENCE_LENGTH = 96        # 4 days of hourly history
+FORECAST_LENGTH = 24        # predict next 24 hours
+BATCH_SIZE      = 16        # smaller batch = better generalisation on small dataset
+EPOCHS          = 150       # high ceiling — early stopping will trigger before this
+LEARNING_RATE   = 0.0003
+PATIENCE        = 20        # stop if val loss doesn't improve for 20 epochs
+DEVICE          = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Feature columns
-FEATURE_COLS = ['cpu_usage', 'memory_usage', 'storage_gb', 'network_gb', 'duration_hours', 'cost']
+FEATURE_COLS = [
+    'cpu_usage', 'memory_usage', 'storage_gb', 'network_gb',
+    'duration_hours', 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos'
+]
+TARGET_COL = 'cost'
 
+# =============================================================================
+# LOGGING
+# =============================================================================
 
-# ============================================================================
-# LOGGING SETUP
-# ============================================================================
-
-def setup_logging() -> logging.Logger:
-    """Configure logging with both file and console handlers"""
-    
+def setup_logging():
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = LOGS_DIR / f'training_{timestamp}.log'
-    
-    # Create logger
+    log_file  = LOGS_DIR / f'training_{timestamp}.log'
+
     logger = logging.getLogger('training')
     logger.setLevel(logging.INFO)
-    
-    # Clear any existing handlers
     logger.handlers.clear()
-    
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    
-    # Try to set UTF-8 encoding for console (Windows fix)
-    if hasattr(sys.stdout, 'reconfigure'):
-        try:
-            sys.stdout.reconfigure(encoding='utf-8')
-        except Exception:
-            pass
-    
-    console_formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
-    )
-    console_handler.setFormatter(console_formatter)
-    
-    # File handler with explicit UTF-8 encoding
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    file_handler.setFormatter(file_formatter)
-    
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
-    
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s',
+                                      datefmt='%H:%M:%S'))
+    fh = logging.FileHandler(log_file, encoding='utf-8')
+    fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
     logger.info(f"Logging initialized. Log file: {log_file}")
+    logger.info(f"Device: {DEVICE}")
+    logger.info(f"Config: seq={SEQUENCE_LENGTH}, forecast={FORECAST_LENGTH}, "
+                f"batch={BATCH_SIZE}, lr={LEARNING_RATE}, patience={PATIENCE}")
     return logger
 
 
-# ============================================================================
-# DATASET CLASS
-# ============================================================================
+# =============================================================================
+# DATASET
+# =============================================================================
 
 class CostTimeSeriesDataset(Dataset):
-    """
-    Dataset for time series cost data
-    Creates sequences for training
-    """
-
-    def __init__(self, data, seq_length=24, forecast_length=7, logger=None):
-        self.seq_length = seq_length
+    def __init__(self, df, seq_length, forecast_length, logger,
+                 feature_scaler=None, cost_scaler=None):
+        self.seq_length      = seq_length
         self.forecast_length = forecast_length
-        self.logger = logger or logging.getLogger('training')
 
-        # Features to use
-        self.feature_cols = FEATURE_COLS
+        df = df.sort_values('hour').reset_index(drop=True)
 
-        # Sort by time
-        self.data = data.sort_values('hour').reset_index(drop=True)
+        features = df[FEATURE_COLS].values
+        cost     = df[TARGET_COL].values.reshape(-1, 1)
 
-        self.logger.info(f"Dataset initialization:")
-        self.logger.info(f"  Total records: {len(self.data):,}")
-        self.logger.info(f"  Features: {self.feature_cols}")
+        # FIX: val set reuses train scalers to prevent data leakage
+        if feature_scaler is None:
+            self.feature_scaler = MinMaxScaler()
+            self.feature_scaler.fit(features)
+        else:
+            self.feature_scaler = feature_scaler
 
-        # Extract and normalize features
-        features = self.data[self.feature_cols].values
+        if cost_scaler is None:
+            self.cost_scaler = MinMaxScaler()
+            self.cost_scaler.fit(np.log1p(cost))
+        else:
+            self.cost_scaler = cost_scaler
 
-        # Use MinMaxScaler for [0, 1] range
-        self.scaler = MinMaxScaler()
-        self.features_normalized = self.scaler.fit_transform(features)
+        self.features = self.feature_scaler.transform(features)
+        self.cost     = self.cost_scaler.transform(np.log1p(cost))
 
-        self.logger.info(f"  Original cost range: ${features[:, -1].min():.4f} - ${features[:, -1].max():.4f}")
-        self.logger.info(f"  Normalized cost range: {self.features_normalized[:, -1].min():.4f} - {self.features_normalized[:, -1].max():.4f}")
+        if logger:
+            logger.info("Dataset initialization:")
+            logger.info(f"  Total records: {len(df)}")
+            logger.info(f"  Feature count: {len(FEATURE_COLS)}")
+            logger.info(f"  Cost range: ${cost.min():.4f} - ${cost.max():.4f}")
 
-        # Create sequences
         self.sequences = self._create_sequences()
 
-        self.logger.info(f"  Created {len(self.sequences):,} sequences")
+        if logger:
+            logger.info(f"  Created {len(self.sequences)} sequences")
 
     def _create_sequences(self):
-        """Create input-output sequence pairs"""
-        sequences = []
-        total_length = self.seq_length + self.forecast_length
+        sequences    = []
+        total        = self.seq_length + self.forecast_length
+        num_features = self.features.shape[1]
 
-        for i in range(len(self.features_normalized) - total_length + 1):
-            # Input: past seq_length hours
-            src = self.features_normalized[i:i + self.seq_length]
+        for i in range(len(self.features) - total + 1):
+            src = self.features[i : i + self.seq_length]
 
-            # Decoder input: seq_length-1 past + forecast_length future
-            tgt_input = self.features_normalized[i + self.seq_length - 1:i + self.seq_length + self.forecast_length - 1]
+            # Decoder input: lagged cost in channel 0, zeros elsewhere
+            cost_hist       = self.cost[
+                i + self.seq_length - 1 : i + self.seq_length + self.forecast_length - 1
+            ]
+            tgt_input       = np.zeros((self.forecast_length, num_features))
+            tgt_input[:, 0] = cost_hist[:, 0]
 
-            # Output: next forecast_length hours (cost only)
-            tgt_output = self.features_normalized[i + self.seq_length:i + self.seq_length + self.forecast_length, -1]
+            # Target flattened to (forecast_len,) — prevents shape mismatch in loss
+            tgt_output = self.cost[
+                i + self.seq_length : i + self.seq_length + self.forecast_length
+            ].flatten()
 
             sequences.append((src, tgt_input, tgt_output))
 
@@ -164,498 +144,279 @@ class CostTimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         src, tgt_input, tgt_output = self.sequences[idx]
-
         return (
-            torch.FloatTensor(src),
-            torch.FloatTensor(tgt_input),
-            torch.FloatTensor(tgt_output)
+            torch.tensor(src,        dtype=torch.float32),
+            torch.tensor(tgt_input,  dtype=torch.float32),
+            torch.tensor(tgt_output, dtype=torch.float32),
         )
 
-    def inverse_transform_cost(self, normalized_costs):
-        """Convert normalized costs back to original scale"""
-        dummy = np.zeros((len(normalized_costs), len(self.feature_cols)))
-        dummy[:, -1] = normalized_costs
-        original = self.scaler.inverse_transform(dummy)
-        return original[:, -1]
+    def inverse_transform_cost(self, values):
+        values   = np.asarray(values).reshape(-1, 1)
+        log_cost = self.cost_scaler.inverse_transform(values)
+        return np.expm1(log_cost).flatten()
 
 
-# ============================================================================
-# TRAINING FUNCTIONS
-# ============================================================================
+# =============================================================================
+# TRAINING
+# =============================================================================
 
 def test_sample_prediction(model, val_loader, dataset, logger):
-    """Test model with a sample to check if predictions are reasonable"""
     model.model.eval()
-
-    # Get one batch
     src, tgt_input, tgt_output = next(iter(val_loader))
-    src = src.to(model.device)
-    tgt_input = tgt_input.to(model.device)
 
     with torch.no_grad():
-        predictions = model.model(src, tgt_input)
-        pred_normalized = predictions[0, :, 0].cpu().numpy()
-        actual_normalized = tgt_output[0].cpu().numpy()
+        preds  = model.model(src.to(model.device), tgt_input.to(model.device))
+        pred   = preds[0, :, 0].cpu().numpy()
+        actual = tgt_output[0].cpu().numpy()
 
-        # Denormalize
-        pred_original = dataset.inverse_transform_cost(pred_normalized)
-        actual_original = dataset.inverse_transform_cost(actual_normalized)
+    pred_d = dataset.inverse_transform_cost(pred)
+    act_d  = dataset.inverse_transform_cost(actual)
 
-        logger.info(f"  Sample prediction check:")
-        logger.info(f"    Predicted costs: ${pred_original.mean():.4f} (avg), ${pred_original.min():.4f}-${pred_original.max():.4f} (range)")
-        logger.info(f"    Actual costs:    ${actual_original.mean():.4f} (avg), ${actual_original.min():.4f}-${actual_original.max():.4f} (range)")
+    logger.info("  Sample prediction:")
+    logger.info(f"    Predicted: avg=${pred_d.mean():.4f} "
+                f"range=[${pred_d.min():.4f}, ${pred_d.max():.4f}]")
+    logger.info(f"    Actual:    avg=${act_d.mean():.4f} "
+                f"range=[${act_d.min():.4f}, ${act_d.max():.4f}]")
 
 
-def train_model(model, train_loader, val_loader, dataset, logger, epochs=100, lr=0.0005):
-    """
-    Train the transformer model with improved training loop
-    """
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        patience=10,
-        factor=0.5
+def train_model(model, train_loader, val_loader, dataset, logger):
+    # HuberLoss is more robust to cost outliers than MSE
+    criterion = nn.HuberLoss(delta=0.5)
+
+    # AdamW has better weight decay regularisation than Adam
+    optimizer = optim.AdamW(
+        model.model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=1e-4
     )
 
-    train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
+    # Cosine annealing smoothly reduces LR to near-zero over training
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS, eta_min=1e-6
+    )
+
+    best_val         = float('inf')
     patience_counter = 0
-    early_stop_patience = 20
+    best_epoch       = 0
+    train_losses, val_losses = [], []
 
-    logger.info("="*70)
-    logger.info("Starting training...")
-    logger.info("="*70)
+    logger.info(f"\nStarting training — up to {EPOCHS} epochs, "
+                f"early stopping patience={PATIENCE}")
+    logger.info("=" * 60)
 
-    for epoch in range(epochs):
-        # Training
+    for epoch in range(EPOCHS):
+
+        # ---- Train ----
         model.model.train()
-        train_loss = 0
-        train_batches = 0
+        train_loss = 0.0
 
-        for batch_idx, (src, tgt_input, tgt_output) in enumerate(train_loader):
-            src = src.to(model.device)
-            tgt_input = tgt_input.to(model.device)
-            tgt_output = tgt_output.to(model.device)
+        for src, tgt_input, tgt_output in train_loader:
+            src        = src.to(model.device)
+            tgt_input  = tgt_input.to(model.device)
+            tgt_output = tgt_output.to(model.device)   # (batch, forecast_len)
 
-            # Forward pass
-            predictions = model.model(src, tgt_input)
+            preds = model.model(src, tgt_input)         # (batch, forecast_len, 1)
+            loss  = criterion(preds.squeeze(-1), tgt_output)
 
-            # Calculate loss
-            loss = criterion(predictions.squeeze(-1), tgt_output)
-
-            # Backward pass
             optimizer.zero_grad()
             loss.backward()
-
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)
-
+            torch.nn.utils.clip_grad_norm_(model.model.parameters(), 1.0)
             optimizer.step()
 
             train_loss += loss.item()
-            train_batches += 1
 
-        train_loss /= train_batches
+        train_loss /= len(train_loader)
         train_losses.append(train_loss)
 
-        # Validation
+        # ---- Validate ----
         model.model.eval()
-        val_loss = 0
-        val_batches = 0
+        val_loss = 0.0
 
         with torch.no_grad():
             for src, tgt_input, tgt_output in val_loader:
-                src = src.to(model.device)
-                tgt_input = tgt_input.to(model.device)
+                src        = src.to(model.device)
+                tgt_input  = tgt_input.to(model.device)
                 tgt_output = tgt_output.to(model.device)
 
-                predictions = model.model(src, tgt_input)
-                loss = criterion(predictions.squeeze(-1), tgt_output)
-                val_loss += loss.item()
-                val_batches += 1
+                preds     = model.model(src, tgt_input)
+                val_loss += criterion(preds.squeeze(-1), tgt_output).item()
 
-        val_loss /= val_batches
+        val_loss /= len(val_loader)
         val_losses.append(val_loss)
 
-        # Learning rate scheduling
-        old_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_loss)
-        new_lr = optimizer.param_groups[0]['lr']
+        scheduler.step()
 
-        if old_lr != new_lr:
-            logger.info(f"  Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
+        # ---- Logging ----
+        if (epoch + 1) % 5 == 0:
+            current_lr = scheduler.get_last_lr()[0]
+            logger.info(f"Epoch [{epoch+1:3d}/{EPOCHS}] "
+                        f"Train: {train_loss:.6f} | "
+                        f"Val: {val_loss:.6f} | "
+                        f"LR: {current_lr:.6f}")
 
-        # Print progress
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            logger.info(f"Epoch [{epoch + 1:3d}/{epochs}] - "
-                       f"Train Loss: {train_loss:.6f}, "
-                       f"Val Loss: {val_loss:.6f}, "
-                       f"LR: {optimizer.param_groups[0]['lr']:.6f}")
-
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            model.save(MODELS_DIR / 'transformer_model.pth')
+        # ---- Checkpoint + early stopping ----
+        if val_loss < best_val:
+            best_val         = val_loss
+            best_epoch       = epoch + 1
             patience_counter = 0
+            model.save(MODELS_DIR / 'transformer_model.pth')
 
-            # Test a sample prediction
             if (epoch + 1) % 10 == 0:
                 test_sample_prediction(model, val_loader, dataset, logger)
         else:
             patience_counter += 1
+            if patience_counter >= PATIENCE:
+                logger.info(f"\nEarly stopping at epoch {epoch + 1}")
+                logger.info(f"Best val loss: {best_val:.6f} at epoch {best_epoch}")
+                break
 
-        # Early stopping
-        if patience_counter >= early_stop_patience:
-            logger.info(f"Early stopping triggered at epoch {epoch + 1}")
-            break
+    logger.info(f"\nTraining complete.")
+    logger.info(f"Best model: epoch {best_epoch}, val loss {best_val:.6f}")
+    return train_losses, val_losses, best_epoch
 
-    logger.info("="*70)
-    logger.info(f"Training complete!")
-    logger.info(f"Best validation loss: {best_val_loss:.6f}")
 
-    return train_losses, val_losses
-
+# =============================================================================
+# METRICS
+# =============================================================================
 
 def calculate_accuracy(model, val_loader, dataset, logger):
-    """
-    Calculate final accuracy metrics using PROPER metrics (not broken MAPE)
-    """
-    
-    logger.info("="*70)
-    logger.info("Calculating Final Accuracy Metrics...")
-    logger.info("="*70)
-
-    # Load best model
-    model.model.load_state_dict(torch.load(MODELS_DIR / 'transformer_model.pth'))
+    model.load(MODELS_DIR / 'transformer_model.pth')
     model.model.eval()
 
-    all_preds = []
-    all_actuals = []
+    preds, trues = [], []
 
     with torch.no_grad():
         for src, tgt_input, tgt_output in val_loader:
-            src = src.to(model.device)
-            tgt_input = tgt_input.to(model.device)
+            p = model.model(src.to(model.device), tgt_input.to(model.device))
+            preds.extend(p.squeeze(-1).cpu().numpy().flatten())
+            trues.extend(tgt_output.cpu().numpy().flatten())
 
-            # Get predictions
-            predictions = model.model(src, tgt_input)
+    y_pred = dataset.inverse_transform_cost(preds)
+    y_true = dataset.inverse_transform_cost(trues)
 
-            # Flatten
-            pred_flat = predictions.squeeze(-1).cpu().numpy().flatten()
-            actual_flat = tgt_output.cpu().numpy().flatten()
+    r2   = r2_score(y_true, y_pred)
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
 
-            all_preds.extend(pred_flat)
-            all_actuals.extend(actual_flat)
+    logger.info("=" * 60)
+    logger.info("FINAL METRICS (best checkpoint, validation set)")
+    logger.info("=" * 60)
+    logger.info(f"R²:   {r2:.4f}  (1.0 = perfect)")
+    logger.info(f"MAE:  ${mae:.4f}")
+    logger.info(f"RMSE: ${rmse:.4f}")
+    logger.info(f"MAPE: {mape:.2f}%")
 
-    # Convert to original dollar scale
-    y_pred_dollars = dataset.inverse_transform_cost(np.array(all_preds))
-    y_true_dollars = dataset.inverse_transform_cost(np.array(all_actuals))
-
-    # ============================================
-    # PROPER METRICS (NOT BROKEN MAPE!)
-    # ============================================
-
-    # 1. R² Score (Variance Explained) - Primary metric
-    r2 = r2_score(y_true_dollars, y_pred_dollars)
-
-    # 2. Mean Absolute Error - Easy to interpret
-    mae = mean_absolute_error(y_true_dollars, y_pred_dollars)
-
-    # 3. Root Mean Squared Error - Penalizes large errors
-    rmse = np.sqrt(mean_squared_error(y_true_dollars, y_pred_dollars))
-
-    # 4. Median Absolute Error - Robust to outliers
-    median_ae = np.median(np.abs(y_true_dollars - y_pred_dollars))
-
-    # 5. Percentage-based metrics (using MAE)
-    avg_cost = y_true_dollars.mean()
-    mae_percentage = (mae / avg_cost) * 100 if avg_cost > 0 else 0
-
-    # 6. OPTIONAL: Filtered MAPE (only for costs > $1.00 to avoid division issues)
-    mask = y_true_dollars > 1.00
-    if np.sum(mask) > 10:  # Only if we have enough high-value samples
-        mape_filtered = np.mean(np.abs((y_true_dollars[mask] - y_pred_dollars[mask]) 
-                                        / y_true_dollars[mask])) * 100
-        coverage_pct = 100 * np.sum(mask) / len(y_true_dollars)
-    else:
-        mape_filtered = None
-        coverage_pct = 0
-
-    # ============================================
-    # PRINT COMPREHENSIVE REPORT
-    # ============================================
-
-    logger.info("\n" + "="*70)
-    logger.info("MODEL PERFORMANCE METRICS")
-    logger.info("="*70)
-
-    logger.info(f"\n PRIMARY METRICS:")
-    logger.info(f"  R² Score (Variance Explained):    {r2:.4f} ({r2*100:.2f}%)")
-    logger.info(f"  Mean Absolute Error (MAE):        ${mae:.4f}")
-    logger.info(f"  Root Mean Squared Error (RMSE):   ${rmse:.4f}")
-    logger.info(f"  Median Absolute Error:            ${median_ae:.4f}")
-
-    logger.info(f"\n PERCENTAGE METRICS:")
-    logger.info(f"  MAE as % of average cost:         {mae_percentage:.2f}%")
-    
-    if mape_filtered is not None and coverage_pct > 50:
-        logger.info(f"  MAPE (costs > $1.00 only):        {mape_filtered:.2f}%")
-        logger.info(f"  Coverage:                         {coverage_pct:.1f}% of data")
-        logger.info(f"  Accuracy (from filtered MAPE):    {100 - mape_filtered:.2f}%")
-    else:
-        logger.info(f"  MAPE: Not computed (insufficient high-value samples)")
-
-    logger.info(f"\n COST STATISTICS:")
-    logger.info(f"  Mean Predicted Cost:              ${y_pred_dollars.mean():.4f}")
-    logger.info(f"  Mean Actual Cost:                 ${y_true_dollars.mean():.4f}")
-    logger.info(f"  Prediction Range:                 ${y_pred_dollars.min():.4f} - ${y_pred_dollars.max():.4f}")
-    logger.info(f"  Actual Range:                     ${y_true_dollars.min():.4f} - ${y_true_dollars.max():.4f}")
+    return y_true, y_pred, r2, mae, rmse
 
 
-    # ============================================
-    # DATA DISTRIBUTION ANALYSIS
-    # ============================================
+# =============================================================================
+# PLOTS
+# =============================================================================
 
-    logger.info("="*70)
-    logger.info("DATA DISTRIBUTION ANALYSIS")
-    logger.info("="*70)
+def plot_results(train_losses, val_losses, y_true, y_pred, best_epoch, logger):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    bins = [0, 0.10, 0.50, 1.00, 5.00, 10.00, float('inf')]
-    labels = ['$0-0.10', '$0.10-0.50', '$0.50-1.00', '$1.00-5.00', '$5.00-10.00', '>$10']
+    # Loss curves
+    axes[0].plot(train_losses, label='Train Loss', color='steelblue', linewidth=1.5)
+    axes[0].plot(val_losses,   label='Val Loss',   color='coral',     linewidth=1.5)
+    if best_epoch <= len(val_losses):
+        axes[0].axvline(best_epoch - 1, color='green', linestyle='--',
+                        label=f'Best (epoch {best_epoch})', linewidth=1.5)
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Huber Loss')
+    axes[0].set_title('Training & Validation Loss')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
 
-    logger.info("\nActual cost distribution:")
-    for i, (low, high) in enumerate(zip(bins[:-1], bins[1:])):
-        count = np.sum((y_true_dollars >= low) & (y_true_dollars < high))
-        pct = 100 * count / len(y_true_dollars)
-        logger.info(f"  {labels[i]:>15}: {count:>6} samples ({pct:>5.1f}%)")
-
-    near_zero = np.sum(y_true_dollars < 0.50)
-    near_zero_pct = 100 * near_zero / len(y_true_dollars)
-    logger.info(f"\n  Values < $0.50: {near_zero} ({near_zero_pct:.1f}%)")
-    logger.info("These low values would break traditional MAPE calculation")
-    logger.info("That's why we use MAE and R² as primary metrics instead")
-
-    logger.info("="*70 + "\n")
-
-    return y_true_dollars, y_pred_dollars, r2, mae, mae_percentage
-
-
-def plot_training_curves(train_losses, val_losses, logger):
-    """Generate and save training curve plots"""
-    
-    logger.info("Generating training plots...")
-    
-    plt.figure(figsize=(12, 5))
-
-    # Loss plot
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Train Loss', alpha=0.7)
-    plt.plot(val_losses, label='Val Loss', alpha=0.7)
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss')
-    plt.title('Training Progress')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    # Zoomed loss plot
-    plt.subplot(1, 2, 2)
-    start_idx = len(train_losses) // 2
-    plt.plot(range(start_idx, len(train_losses)), train_losses[start_idx:], label='Train Loss', alpha=0.7)
-    plt.plot(range(start_idx, len(val_losses)), val_losses[start_idx:], label='Val Loss', alpha=0.7)
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss')
-    plt.title('Training Progress (Last 50%)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plot_path = MODELS_DIR / 'training_curve.png'
-    plt.savefig(plot_path, dpi=150)
-    logger.info(f"✓ Training curve saved to: {plot_path}")
-    plt.close()
-
-
-def plot_accuracy_scatter(y_true, y_pred, r2, mae, logger):
-    """Generate and save accuracy scatter plot with proper metrics"""
-    
-    plt.figure(figsize=(10, 10))
-    
-    # Main scatter plot
-    plt.scatter(y_true, y_pred, alpha=0.3, color='teal', s=20)
-    
-    # Add identity line (perfect predictions)
+    # Predicted vs actual scatter
     max_val = max(y_true.max(), y_pred.max())
-    min_val = min(y_true.min(), y_pred.min())
-    plt.plot([min_val, max_val], [min_val, max_val], 
-             color='red', lw=2, linestyle='--', label='Perfect Prediction')
-    
-    # Add ±20% error bands
-    plt.plot([min_val, max_val], [min_val*0.8, max_val*0.8], 
-             color='orange', lw=1, linestyle=':', alpha=0.5, label='±20% Error')
-    plt.plot([min_val, max_val], [min_val*1.2, max_val*1.2], 
-             color='orange', lw=1, linestyle=':', alpha=0.5)
-    
-    plt.xlabel('Actual Cost ($)', fontsize=12)
-    plt.ylabel('Predicted Cost ($)', fontsize=12)
-    plt.title(f'Actual vs Predicted Cost\nR²: {r2:.4f} | MAE: ${mae:.4f}', 
-              fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3)
-    plt.legend()
+    axes[1].scatter(y_true, y_pred, alpha=0.3, s=5, color='steelblue')
+    axes[1].plot([0, max_val], [0, max_val], 'r--', linewidth=1.5, label='Perfect fit')
+    axes[1].set_xlabel('Actual Cost ($)')
+    axes[1].set_ylabel('Predicted Cost ($)')
+    axes[1].set_title('Predicted vs Actual')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
     plt.tight_layout()
-    
-    plot_path = MODELS_DIR / 'accuracy_scatter.png'
-    plt.savefig(plot_path, dpi=150)
-    logger.info(f"✓ Accuracy scatter plot saved to: {plot_path}")
+    plot_path = MODELS_DIR / 'training_results.png'
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     plt.close()
+    logger.info(f"Plot saved: {plot_path}")
 
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
-    """Main training pipeline"""
-    
-    # Setup logging
     logger = setup_logging()
-    
-    try:
-        logger.info("="*70)
-        logger.info("TRANSFORMER MODEL TRAINING - CLOUD COST FORECASTING")
-        logger.info("="*70)
-        logger.info(f"Device: {DEVICE}")
-        logger.info(f"Sequence length: {SEQUENCE_LENGTH} hours")
-        logger.info(f"Forecast length: {FORECAST_LENGTH} hours")
-        logger.info(f"Batch size: {BATCH_SIZE}")
-        logger.info(f"Epochs: {EPOCHS}")
-        logger.info(f"Learning rate: {LEARNING_RATE}")
-        logger.info("="*70)
 
-        # Step 1: Load data
-        logger.info("\n[1/6] Loading processed data...")
-        cost_df = pd.read_csv(PROCESSED_DIR / 'cost_timeseries.csv')
-        logger.info(f"✓ Loaded {len(cost_df):,} records")
+    df = pd.read_csv(PROCESSED_DIR / 'cost_timeseries.csv')
+    logger.info(f"Loaded {len(df):,} rows from cost_timeseries.csv")
 
-        # Data sufficiency check
-        min_required = SEQUENCE_LENGTH + FORECAST_LENGTH
+    # Time-based split — NEVER shuffle time series data
+    split    = int(0.8 * len(df))
+    train_df = df.iloc[:split].reset_index(drop=True)
+    val_df   = df.iloc[split:].reset_index(drop=True)
+    logger.info(f"Train rows: {len(train_df):,} | Val rows: {len(val_df):,}")
 
-        logger.info("\nData requirements check:")
-        logger.info(f"  Sequence length: {SEQUENCE_LENGTH}")
-        logger.info(f"  Forecast length: {FORECAST_LENGTH}")
-        logger.info(f"  Total required hours: {min_required}")
-        logger.info(f"  Available data hours: {len(cost_df)}")
+    # Build datasets
+    train_dataset = CostTimeSeriesDataset(
+        train_df, SEQUENCE_LENGTH, FORECAST_LENGTH, logger)
 
-        if len(cost_df) < min_required:
-            logger.error(
-                f"Insufficient data: need at least {min_required} hours, "
-                f"but only {len(cost_df)} available"
-            )
-            sys.exit(1)
-        else:
-            logger.info(f"Data sufficient: {len(cost_df)} >= {min_required}")
+    # Val reuses train scalers — critical to prevent data leakage
+    val_dataset = CostTimeSeriesDataset(
+        val_df, SEQUENCE_LENGTH, FORECAST_LENGTH, logger=None,
+        feature_scaler=train_dataset.feature_scaler,
+        cost_scaler=train_dataset.cost_scaler,
+    )
 
-        # Step 2: Create dataset
-        logger.info("\n[2/6] Creating dataset...")
-        dataset = CostTimeSeriesDataset(
-            cost_df,
-            seq_length=SEQUENCE_LENGTH,
-            forecast_length=FORECAST_LENGTH,
-            logger=logger
-        )
+    logger.info(f"Train sequences: {len(train_dataset):,}")
+    logger.info(f"Val sequences:   {len(val_dataset):,}")
 
-        # Step 3: Split data
-        logger.info("\n[3/6] Splitting data...")
-        train_size = int(0.8 * len(dataset))
-        val_size = len(dataset) - train_size
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True,  drop_last=True)
+    val_loader   = DataLoader(
+        val_dataset,   batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
 
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            dataset,
-            [train_size, val_size]
-        )
+    # Smaller model — appropriate for ~3000 training sequences
+    model = CostForecaster(
+        input_dim=len(FEATURE_COLS),
+        d_model=48,
+        nhead=4,               # must divide d_model evenly: 48 / 4 = 12 OK
+        num_encoder_layers=2,
+        num_decoder_layers=2,
+        dim_feedforward=128,
+        dropout=0.2,           # increased from 0.1 to combat overfitting
+        output_dim=1,
+        device=DEVICE
+    )
 
-        logger.info(f"  Train: {len(train_dataset):,} sequences")
-        logger.info(f"  Val: {len(val_dataset):,} sequences")
+    total_params = sum(p.numel() for p in model.model.parameters())
+    logger.info(f"Model parameters: {total_params:,}")
 
-        # Create data loaders
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    # Train
+    train_losses, val_losses, best_epoch = train_model(
+        model, train_loader, val_loader, train_dataset, logger)
 
-        # Step 4: Initialize model
-        logger.info("\n[4/6] Initializing model...")
-        model = CostForecaster(
-            input_dim=6,  # cpu, memory, storage, network, duration, cost
-            d_model=64,
-            nhead=4,
-            num_encoder_layers=3,
-            num_decoder_layers=3,
-            dim_feedforward=256,
-            dropout=0.1,
-            output_dim=1,
-            device=DEVICE
-        )
+    # Save scalers (must match what inference uses)
+    with open(MODELS_DIR / 'feature_scaler.pkl', 'wb') as f:
+        pickle.dump(train_dataset.feature_scaler, f)
+    with open(MODELS_DIR / 'cost_scaler.pkl', 'wb') as f:
+        pickle.dump(train_dataset.cost_scaler, f)
+    logger.info("Scalers saved.")
 
-        total_params = sum(p.numel() for p in model.model.parameters())
-        trainable_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
-        logger.info(f"  Total parameters: {total_params:,}")
-        logger.info(f"  Trainable parameters: {trainable_params:,}")
+    # Evaluate on best checkpoint
+    y_true, y_pred, r2, mae, rmse = calculate_accuracy(
+        model, val_loader, train_dataset, logger)
 
-        # Step 5: Train model
-        logger.info("\n[5/6] Training model...")
-        train_losses, val_losses = train_model(
-            model,
-            train_loader,
-            val_loader,
-            dataset,
-            logger,
-            epochs=EPOCHS,
-            lr=LEARNING_RATE
-        )
+    # Save plots
+    plot_results(train_losses, val_losses, y_true, y_pred, best_epoch, logger)
 
-        # Save scaler
-        logger.info("\nSaving scaler...")
-        scaler_path = MODELS_DIR / 'scaler.pkl'
-        with open(scaler_path, 'wb') as f:
-            pickle.dump(dataset.scaler, f)
-        logger.info(f"✓ Scaler saved to {scaler_path}")
-
-        # Step 6: Calculate accuracy with PROPER metrics
-        logger.info("\n[6/6] Calculating accuracy metrics...")
-        y_true, y_pred, r2, mae, mae_pct= calculate_accuracy(
-            model, val_loader, dataset, logger
-        )
-
-        # Generate plots
-        plot_training_curves(train_losses, val_losses, logger)
-        plot_accuracy_scatter(y_true, y_pred, r2, mae, logger)
-
-        # Final summary
-        logger.info("\n" + "="*70)
-        logger.info(" TRAINING COMPLETE!")
-        logger.info("="*70)
-        logger.info(f"\n Saved Files:")
-        logger.info(f"  Model:         {MODELS_DIR / 'transformer_model.pth'}")
-        logger.info(f"  Scaler:        {scaler_path}")
-        logger.info(f"  Training plot: {MODELS_DIR / 'training_curve.png'}")
-        logger.info(f"  Accuracy plot: {MODELS_DIR / 'accuracy_scatter.png'}")
-        
-        logger.info(f"\n Final Metrics:")
-        logger.info(f"  R² Score:      {r2:.4f} ({r2*100:.1f}%)")
-        logger.info(f"  MAE:           ${mae:.4f} ({mae_pct:.1f}% of avg)")
-
-        return 0
-
-    except FileNotFoundError as e:
-        logger.error(f"\n File not found: {str(e)}")
-        logger.error("Please run preprocessing first: python scripts/preprocess_data.py")
-        return 1
-    except Exception as e:
-        logger.exception(f"\n Unexpected error: {str(e)}")
-        return 1
+    logger.info("\nDone.")
 
 
 if __name__ == '__main__':
-    exit_code = main()
-    sys.exit(exit_code)
+    main()

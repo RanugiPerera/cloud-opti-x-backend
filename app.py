@@ -13,16 +13,19 @@ CORS(app)
 app.register_blueprint(forecast.bp)
 
 
-
 # welcome endpoint
 @app.route('/')
 def index():
     return jsonify({
-        "service": "Multi-Cloud Cost Optimization API",
-        "version": "1.0.0",
-        "status": "running",
+        "service":     "Multi-Cloud Cost Optimization API",
+        "version":     "2.0.0",
+        "status":      "running",
+        "model":       "XGBoost ",
         "endpoints": {
-            "forecast": "/api/forecast",
+            "forecast":         "POST /api/forecast",
+            "compare":          "GET  /api/forecast/compare",
+            "stats":            "GET  /api/forecast/stats",
+            "health_check":     "GET  /api/forecast/test",
         }
     })
 
@@ -40,12 +43,16 @@ def internal_error(error):
 
 if __name__ == '__main__':
     print("=" * 60)
-    print(" Multi-Cloud Cost Optimization API")
+    print("  Multi-Cloud Cost Optimization API")
+    print("  XGBoost Forecaster + DQN RL Agent")
     print("=" * 60)
     print("Starting server on http://localhost:5000")
     print("\nAvailable endpoints:")
-    print("  GET  /                      - API info")
-    print("  POST /api/forecast          - Cost forecasting")
+    print("  GET  /                          - API info")
+    print("  POST /api/forecast              - Single provider forecast")
+    print("  GET  /api/forecast/compare      - AWS vs Azure comparison")
+    print("  GET  /api/forecast/stats        - Model metadata")
+    print("  GET  /api/forecast/test         - Health check")
     print("=" * 60)
 
     app.run(host='0.0.0.0', port=5000, debug=True)

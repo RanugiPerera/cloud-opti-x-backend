@@ -230,4 +230,4 @@ print(f"Average Reward (last 50): {np.mean(episode_rewards[-50:]):.3f}")
 print(f"Average Cost (last 50): ${np.mean(episode_costs[-50:]):.3f}")
 print(f"Model saved to: {model_path}")
 
-print("\n✅ RL training complete!")
+print("\n RL training complete!")

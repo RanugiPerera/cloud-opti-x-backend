@@ -50,7 +50,7 @@ class Config:
     # Model Hyperparameters
     # ==========================================
     # Transformer
-    TRANSFORMER_INPUT_DIM = 4  # cpu, memory, duration, cost
+    TRANSFORMER_INPUT_DIM = 6  # cpu, memory, duration, cost, storage, network
     TRANSFORMER_D_MODEL = 64
     TRANSFORMER_NHEAD = 4
     TRANSFORMER_NUM_ENCODER_LAYERS = 3
@@ -75,8 +75,8 @@ class Config:
     SEQUENCE_LENGTH = 168  # hours of historical data
     FORECAST_LENGTH = 24  # hours to predict
     BATCH_SIZE = 32
-    EPOCHS = 50
-    LEARNING_RATE = 0.001
+    EPOCHS = 100
+    LEARNING_RATE = 0.0005
 
     # ==========================================
     # API Settings
