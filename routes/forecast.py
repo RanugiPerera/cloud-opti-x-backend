@@ -1,6 +1,5 @@
 """
 Forecast API Blueprint
-======================
 Flask routes that expose the XGBoost cost forecasting model via REST API.
 
 Endpoints
@@ -9,21 +8,28 @@ POST /api/forecast          — generate N-hour cost forecast
 GET  /api/forecast/compare  — side-by-side AWS vs Azure comparison
 GET  /api/forecast/stats    — model info and cost history summary
 GET  /api/forecast/test     — health check
-
 """
 
 import logging
 from datetime import datetime
 from flask import Blueprint, jsonify, request
 
-# Import the service layer that wraps the XGBoost model
-from services.forecast_service import ForecastService
-
 logger = logging.getLogger(__name__)
 
-# Initialise once at import time — loads model and pricing from disk
-# This means the model is ready on first request with no cold-start delay
-_service = ForecastService()
+_service = None
+
+def get_service():
+    """Return the ForecastService singleton, initialising it on first call."""
+    global _service
+    if _service is None:
+        try:
+            from services.forecast_service import ForecastService
+            _service = ForecastService()
+            logger.info("ForecastService initialised successfully")
+        except Exception as e:
+            logger.error(f"ForecastService failed to initialise: {e}")
+            raise
+    return _service
 
 bp = Blueprint("forecast", __name__, url_prefix="/api")
 
@@ -34,9 +40,7 @@ bp = Blueprint("forecast", __name__, url_prefix="/api")
 
 @bp.route("/forecast", methods=["POST"])
 def forecast_costs():
-    """
-    Generate a cost forecast for a specific provider and horizon.
-    """
+
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "Request body must be JSON"}), 400
@@ -63,7 +67,7 @@ def forecast_costs():
 
     # ── Run forecast ──────────────────────────────────────────────────────────
     try:
-        result = _service.predict_costs(
+        result = get_service().predict_costs(
             cloud_provider = cloud_provider,
             forecast_hours = forecast_hours,
         )
@@ -113,8 +117,8 @@ def forecast_costs():
 @bp.route("/forecast/compare", methods=["GET"])
 def compare_providers():
     """
-    Generate side-by-side forecasts for AWS and Azure and compare total costs.
-    """
+    Generate side-by-side AWS vs Azure forecast and return cost comparison.
+"""
     forecast_hours = request.args.get("forecast_hours", 48, type=int)
     if not (1 <= forecast_hours <= 48):
         return jsonify({
@@ -122,8 +126,8 @@ def compare_providers():
         }), 400
 
     try:
-        aws_result   = _service.predict_costs("aws",   forecast_hours)
-        azure_result = _service.predict_costs("azure", forecast_hours)
+        aws_result   = get_service().predict_costs("aws",   forecast_hours)
+        azure_result = get_service().predict_costs("azure", forecast_hours)
     except Exception as exc:
         logger.exception("Compare forecast failed")
         return jsonify({"error": str(exc)}), 500
@@ -184,8 +188,9 @@ def compare_providers():
 
 @bp.route("/forecast/stats", methods=["GET"])
 def get_forecast_stats():
+
     try:
-        stats = _service.get_stats()
+        stats = get_service().get_stats()
     except Exception as exc:
         logger.exception("Stats failed")
         return jsonify({"error": str(exc)}), 500
@@ -201,21 +206,9 @@ def get_forecast_stats():
 def test_forecast():
     """
     Health check — verifies the model loads and produces valid predictions.
-
-    Response
-    --------
-    {
-        "status":  "success",
-        "message": "XGBoost forecast model is operational",
-        "sample": {
-            "provider": "aws",
-            "hour_1_cost": 0.823,
-            "hour_24_cost": 1.341
-        }
-    }
     """
     try:
-        result = _service.predict_costs("aws", forecast_hours=24)
+        result = get_service().predict_costs("aws", forecast_hours=24)
         costs  = result["costs"]
 
         return jsonify({
