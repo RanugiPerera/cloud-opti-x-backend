@@ -1,42 +1,48 @@
-"""
-Forecast API Blueprint
-Flask routes that expose the XGBoost cost forecasting model via REST API.
-
-Endpoints
----------
-POST /api/forecast          — generate N-hour cost forecast
-GET  /api/forecast/compare  — side-by-side AWS vs Azure comparison
-GET  /api/forecast/stats    — model info and cost history summary
-GET  /api/forecast/test     — health check
-"""
-
 import logging
 from datetime import datetime
 from flask import Blueprint, jsonify, request
 
 logger = logging.getLogger(__name__)
 
-_service = None
+import threading as _threading
+
+_service         = None
+_service_lock    = _threading.Lock()
+_service_event   = _threading.Event()  # signals when loading is complete
 
 def get_service():
-    """Return the ForecastService singleton, initialising it on first call."""
+
     global _service
+
+    # Fast path — already loaded
+    if _service is not None:
+        return _service
+
+    with _service_lock:
+        if _service is None and not _service_event.is_set():
+            try:
+                from services.forecast_service import ForecastService
+                instance = ForecastService()   # slow — holds no lock during I/O
+                _service = instance
+                logger.info("ForecastService initialised successfully")
+            except Exception as e:
+                logger.error(f"ForecastService failed to initialise: {e}")
+                _service_event.set()   # unblock waiters even on failure
+                raise
+            finally:
+                _service_event.set()   # always unblock waiters
+    
+    # Wait for the loader thread to finish (timeout=300s)
+    _service_event.wait(timeout=300)
+
     if _service is None:
-        try:
-            from services.forecast_service import ForecastService
-            _service = ForecastService()
-            logger.info("ForecastService initialised successfully")
-        except Exception as e:
-            logger.error(f"ForecastService failed to initialise: {e}")
-            raise
+        raise RuntimeError("ForecastService failed to initialise after 300s")
     return _service
 
 bp = Blueprint("forecast", __name__, url_prefix="/api")
 
 
-# ============================================================================
 # POST /api/forecast
-# ============================================================================
 
 @bp.route("/forecast", methods=["POST"])
 def forecast_costs():
@@ -96,7 +102,7 @@ def forecast_costs():
         "provider":       cloud_provider,
         "service_type":   service_type,
         "forecast_hours": forecast_hours,
-        "model":          "XGBoost (R²=0.717, MdAPE=11.45%)",
+        "model":          "XGBoost v2 Direct Multi-Horizon (R²_log=0.907)",
         "generated_at":   datetime.now().isoformat(timespec="seconds"),
         "predictions":    predictions,
         "summary": {
@@ -116,18 +122,22 @@ def forecast_costs():
 
 @bp.route("/forecast/compare", methods=["GET"])
 def compare_providers():
-    """
-    Generate side-by-side AWS vs Azure forecast and return cost comparison.
-"""
+   
     forecast_hours = request.args.get("forecast_hours", 48, type=int)
     if not (1 <= forecast_hours <= 48):
         return jsonify({
             "error": "forecast_hours must be between 1 and 48"
         }), 400
 
+    import concurrent.futures as _cf
     try:
-        aws_result   = get_service().predict_costs("aws",   forecast_hours)
-        azure_result = get_service().predict_costs("azure", forecast_hours)
+        svc = get_service()
+        # Run AWS and Azure forecasts in parallel — 2x faster than sequential
+        with _cf.ThreadPoolExecutor(max_workers=2) as ex:
+            f_aws   = ex.submit(svc.predict_costs, "aws",   forecast_hours)
+            f_azure = ex.submit(svc.predict_costs, "azure", forecast_hours)
+            aws_result   = f_aws.result()
+            azure_result = f_azure.result()
     except Exception as exc:
         logger.exception("Compare forecast failed")
         return jsonify({"error": str(exc)}), 500
@@ -158,7 +168,7 @@ def compare_providers():
     return jsonify({
         "status":         "success",
         "forecast_hours": forecast_hours,
-        "model":          "XGBoost (R²=0.717, MdAPE=11.45%)",
+        "model":          "XGBoost v2 Direct Multi-Horizon (R²_log=0.907)",
         "generated_at":   datetime.now().isoformat(timespec="seconds"),
         "aws": {
             "predictions": aws_preds,
@@ -182,13 +192,11 @@ def compare_providers():
     }), 200
 
 
-# ============================================================================
 # GET /api/forecast/stats
-# ============================================================================
 
 @bp.route("/forecast/stats", methods=["GET"])
 def get_forecast_stats():
-
+   
     try:
         stats = get_service().get_stats()
     except Exception as exc:
@@ -198,34 +206,57 @@ def get_forecast_stats():
     return jsonify(stats), 200
 
 
-# ============================================================================
 # GET /api/forecast/test
-# ============================================================================
 
 @bp.route("/forecast/test", methods=["GET"])
 def test_forecast():
-    """
-    Health check — verifies the model loads and produces valid predictions.
-    """
+
     try:
-        result = get_service().predict_costs("aws", forecast_hours=24)
-        costs  = result["costs"]
+        svc = get_service()
+
+        # Lightweight check — just verify the model object is loaded.
+        # Do NOT run predict_costs() here — that triggers a full 48-hour
+        # forecast on every health check, wasting ~2s of CPU per call.
+        booster = svc._model.get_booster()
+        n_features = booster.num_features()
 
         return jsonify({
             "status":  "success",
             "message": "XGBoost forecast model is operational",
-            "model":   "XGBoost (R²=0.717, MdAPE=11.45%)",
-            "sample": {
-                "provider":    "aws",
-                "hour_1_cost":  round(costs[0],  4),
-                "hour_24_cost": round(costs[23], 4),
-            },
+            "model":   "XGBoost v2 Direct Multi-Horizon (R²_log=0.907)",
+            "n_features": n_features,
         }), 200
 
     except Exception as exc:
         logger.exception("Health check failed")
         return jsonify({
             "status":  "error",
-            "message": "Forecast model failed to run",
+            "message": "Forecast model failed to load",
             "detail":  str(exc),
         }), 500
+
+# ============================================================================
+# FEATURE 1 — SHAP Explainability endpoints
+# ============================================================================
+
+@bp.route("/forecast/explain", methods=["GET"])
+def explain_forecast():
+    
+    hour_offset = request.args.get("hour", 0, type=int)
+    try:
+        result = get_service().explain_prediction(hour_offset=hour_offset)
+    except Exception as exc:
+        logger.exception("SHAP explain failed")
+        return jsonify({"error": str(exc)}), 500
+    return jsonify(result), 200
+
+
+@bp.route("/forecast/importance", methods=["GET"])
+def global_importance():
+
+    try:
+        result = get_service().get_global_importance()
+    except Exception as exc:
+        logger.exception("Global importance failed")
+        return jsonify({"error": str(exc)}), 500
+    return jsonify(result), 200

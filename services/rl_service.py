@@ -256,9 +256,9 @@ class RLService:
                 "cost_reduction_pct": 58.3,
             },
             "integration": {
-                "forecaster":              "XGBoost",
+                "forecaster":              "XGBoost (R²=0.717, MdAPE=11.45%)",
                 "state_includes_forecast": True,
                 "forecast_horizon_hours":  6,
-                "cost_transitions":        "XGBoost-driven",
+                "cost_transitions":        "XGBoost-driven (not hardcoded)",
             },
         }

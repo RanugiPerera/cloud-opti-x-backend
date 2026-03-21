@@ -1,3 +1,23 @@
+"""
+Integrated RL Training Script
+==============================
+Trains the DQN agent inside the ForecastDrivenCloudEnvironment,
+where every cost transition is driven by the XGBoost forecaster.
+
+Run order
+---------
+1. python scripts/full_pipeline_v2.py       — train v2 XGBoost forecaster
+2. python scripts/train_rl_integrated.py    — train RL agent (this file)
+3. python scripts/forecast_demo.py          — generate demo charts
+
+What this demonstrates for your thesis
+---------------------------------------
+The RL agent learns a policy over the XGBoost forecast horizon:
+  - State includes the 1h/3h/6h cost forecast → agent plans ahead
+  - Actions affect scale_factor and provider → directly drives cost
+  - Reward penalises cost, rewards anticipatory provider switching
+  - The two models are tightly coupled: XGBoost forecasts, RL decides
+"""
 
 import glob
 import logging
@@ -15,7 +35,12 @@ PLOTS_DIR  = BASE_DIR / "data" / "processed"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-
+# ── Robust import: find rl_agent_integrated.py wherever it lives ─────────────
+# Searches these locations in order:
+#   1. project_root/models/
+#   2. same folder as this script  (scripts/)
+#   3. scripts/models/
+#   4. project root itself
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _candidates = [
     BASE_DIR / "models",          # correct location
@@ -57,23 +82,33 @@ DEVICE             = "cpu"
 # ============================================================================
 
 def load_xgb_model() -> xgb.XGBRegressor:
-    model_files = sorted(glob.glob(str(MODELS_DIR / "xgb_cost_model_*.json")))
-    if not model_files:
-        raise FileNotFoundError(
-            f"No XGBoost model found in {MODELS_DIR}.\n"
-            "Run full_pipeline.py first."
-        )
-    path = model_files[-1]
+    """
+    Load the +1h q50 model from v2 pipeline (direct multi-horizon).
+    Falls back to v1 single model if v2 models are not found.
+    The +1h model is used for the RL environment because the agent
+    makes 1-step transitions — it needs 1-hour-ahead cost predictions.
+    """
+    # v2: look for horizon-specific q50 model (point forecast)
+    v2_files = sorted(glob.glob(str(MODELS_DIR / "xgb_h1h_q50_*.json")))
+    if v2_files:
+        path = v2_files[-1]
+        logger.info(f"Loading v2 direct +1h model: {Path(path).name}")
+    else:
+        # fallback to v1 single model
+        v1_files = sorted(glob.glob(str(MODELS_DIR / "xgb_cost_model_*.json")))
+        if not v1_files:
+            raise FileNotFoundError(
+                f"No XGBoost model found in {MODELS_DIR}.\n"
+                "Run full_pipeline_v2.py first to train v2 models."
+            )
+        path = v1_files[-1]
+        logger.info(f"v2 models not found — loading v1 fallback: {Path(path).name}")
+
     model = xgb.XGBRegressor()
     model.load_model(path)
     feat_names = model.get_booster().feature_names
-    if feat_names is None:
-        raise RuntimeError(
-            "Model was saved without feature names. "
-            "Re-run full_pipeline.py with the latest version."
-        )
-    logger.info(f"XGBoost model loaded: {Path(path).name} "
-                f"({len(feat_names)} features)")
+    n_feat = len(feat_names) if feat_names else model.get_booster().num_features()
+    logger.info(f"XGBoost model loaded: {Path(path).name} ({n_feat} features)")
     return model
 
 
@@ -82,7 +117,11 @@ def load_xgb_model() -> xgb.XGBRegressor:
 # ============================================================================
 
 def build_cost_history(n: int = 2000) -> np.ndarray:
-
+    """
+    Reconstruct a realistic cost history using the same log-space model
+    as the training pipeline. This gives the RL environment a proper
+    cost buffer so lag features are well-initialised from episode start.
+    """
     rng      = np.random.default_rng(42)
     phi, sigma = 0.70, 0.06
 
@@ -261,7 +300,9 @@ def plot_training(stats: dict, output_path: Path) -> None:
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle(
-        "DQN Training Curves — Integrated Environment",
+        "Integrated RL Training — DQN + XGBoost Cost Forecaster\n"
+        "State includes XGBoost 1h/3h/6h forecast; "
+        "transitions driven by forecaster",
         fontsize=11, fontweight="bold",
     )
 

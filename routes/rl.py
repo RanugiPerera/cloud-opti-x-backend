@@ -1,17 +1,3 @@
-"""
-RL Agent API Blueprint
-======================
-Flask routes that expose the DQN reinforcement learning agent via REST API.
-
-Endpoints
----------
-POST /api/rl/recommend          — get action recommendation for current state
-GET  /api/rl/simulate           — run a full episode and return step-by-step decisions
-GET  /api/rl/stats              — agent metadata and training summary
-GET  /api/rl/test               — health check
-
-"""
-
 import logging
 import sys
 from datetime import datetime
@@ -23,20 +9,37 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("rl", __name__, url_prefix="/api/rl")
 
-# Lazy singleton — initialised on first request
-_rl_service = None
+import threading as _threading
 
+_rl_service       = None
+_rl_service_lock  = _threading.Lock()
+_rl_service_event = _threading.Event()
 
 def get_rl_service():
+    """Return the RLService singleton using Event-based pattern."""
     global _rl_service
+
+    if _rl_service is not None:
+        return _rl_service
+
+    with _rl_service_lock:
+        if _rl_service is None and not _rl_service_event.is_set():
+            try:
+                from services.rl_service import RLService
+                instance    = RLService()
+                _rl_service = instance
+                logger.info("RLService initialised successfully")
+            except Exception as e:
+                logger.error(f"RLService failed to initialise: {e}")
+                _rl_service_event.set()
+                raise
+            finally:
+                _rl_service_event.set()
+
+    _rl_service_event.wait(timeout=300)
+
     if _rl_service is None:
-        try:
-            from services.rl_service import RLService
-            _rl_service = RLService()
-            logger.info("RLService initialised successfully")
-        except Exception as e:
-            logger.error(f"RLService failed to initialise: {e}")
-            raise
+        raise RuntimeError("RLService failed to initialise after 300s")
     return _rl_service
 
 
@@ -46,41 +49,7 @@ def get_rl_service():
 
 @bp.route("/recommend", methods=["POST"])
 def recommend():
-    """
-    Get the agent's recommended action given a current cloud state.
-
-    The agent observes the current cost + XGBoost 6-hour forecast and
-    returns the optimal action according to the learned policy.
-
-    Request body (JSON)
-    -------------------
-    {
-        "current_cost":   1.20,        (current $/hr — required)
-        "provider":       "aws",       (current provider — default: "aws")
-        "scale_factor":   1.0          (current resource scale — default: 1.0)
-    }
-
-    Response
-    --------
-    {
-        "status":          "success",
-        "action":          "scale_down",
-        "action_id":       1,
-        "reasoning":       "Forecast shows costs declining — scale down to reduce spend",
-        "current_state": {
-            "current_cost":   1.20,
-            "provider":       "aws",
-            "scale_factor":   1.0,
-            "forecast_1h":    1.15,
-            "forecast_3h":    0.95,
-            "forecast_6h":    0.72
-        },
-        "expected_outcome": {
-            "estimated_cost_after": 0.90,
-            "cost_saving_pct":      25.0
-        }
-    }
-    """
+   
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "Request body must be JSON"}), 400
@@ -122,13 +91,7 @@ def recommend():
 
 @bp.route("/simulate", methods=["GET"])
 def simulate():
-    """
-    Run the agent through a full episode and return step-by-step decisions.
-
-    This is the key demo endpoint — it shows the agent making 48 sequential
-    decisions using the XGBoost forecast at each step.
-
-    """
+   
     hours    = request.args.get("hours",    24,    type=int)
     provider = request.args.get("provider", "aws", type=str).lower()
 
@@ -156,9 +119,7 @@ def simulate():
 
 @bp.route("/stats", methods=["GET"])
 def get_stats():
-    """
-    Return RL agent metadata and training summary.
-    """
+   
     try:
         stats = get_rl_service().get_stats()
     except Exception as exc:
@@ -174,26 +135,27 @@ def get_stats():
 
 @bp.route("/test", methods=["GET"])
 def test_agent():
-    """
-    Health check — verifies the RL agent loads and produces valid actions.
 
-    """
     try:
-        result = get_rl_service().recommend(
-            current_cost = 1.10,
-            provider     = "aws",
-            scale_factor = 1.0,
-        )
+        svc = get_rl_service()
+
+        # Lightweight check — verify agent network is loaded.
+        # Do NOT call recommend() here — that runs a full XGBoost
+        # forward pass on every health check.
+        import torch
+        n_params = sum(p.numel() for p in svc._agent.q_network.parameters())
+
         return jsonify({
-            "status":        "success",
-            "message":       "DQN agent is operational",
-            "sample_action": result["action"],
+            "status":   "success",
+            "message":  "DQN agent is operational",
+            "n_params": n_params,
+            "actions":  ["scale_up", "scale_down", "migrate_aws", "migrate_azure"],
         }), 200
 
     except Exception as exc:
         logger.exception("RL health check failed")
         return jsonify({
             "status":  "error",
-            "message": "DQN agent failed to run",
+            "message": "DQN agent failed to load",
             "detail":  str(exc),
         }), 500

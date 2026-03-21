@@ -115,8 +115,9 @@ def _weekly_log(dow: np.ndarray) -> np.ndarray:
 def build_xgb_row(history: List[float], timestamp: datetime,
                   hour_offset: int) -> dict:
     """
-    Build a single feature row for the XGBoost model.
-    Identical feature construction to the training pipeline.
+    Build a single feature row matching the v2 pipeline short-horizon feature set.
+    Includes lag_cost_0h and lag_log_cost_0h added in v2 for +1h accuracy.
+    Falls back cleanly to v1 feature set via row.get(f, 0.0) safety net.
     """
     buf = np.array(history[-200:], dtype=np.float64)
 
@@ -126,6 +127,12 @@ def build_xgb_row(history: List[float], timestamp: datetime,
     EWMA_SPANS   = [6, 24, 168]
 
     row = {}
+
+    # v2: current observation (no shift) — most predictive feature at +1h
+    # AR(1) phi=0.70: corr(cost[t], cost[t+1]) = 0.70
+    row["lag_cost_0h"]      = float(buf[-1])
+    row["lag_log_cost_0h"]  = float(np.log1p(buf[-1]))
+
     for lag in range(1, LAG_HOURS + 1):
         row[f"lag_cost_{lag}h"] = float(buf[-lag]) if len(buf) >= lag else float(buf[0])
     for lag in LAG_ANCHORS:
@@ -149,6 +156,20 @@ def build_xgb_row(history: List[float], timestamp: datetime,
     row["lag_log_cost_24h"] = float(np.log1p(buf[-24] if len(buf) >= 24 else buf[0]))
     row["cost_delta_1h"]    = float(buf[-1] - buf[-2])  if len(buf) >= 2  else 0.0
     row["cost_delta_24h"]   = float(buf[-1] - buf[-25]) if len(buf) >= 25 else 0.0
+
+    # v2 short-horizon features: AR residual and percentile position
+    ewma6 = row["ewma_6h"]
+    row["ar_residual_0h"]   = float(buf[-1]) - ewma6
+    roll24_vals = buf[-24:] if len(buf) >= 24 else buf
+    rng_24 = float(np.max(roll24_vals) - np.min(roll24_vals))
+    row["cost_pctile_24h"]  = float(
+        (buf[-1] - np.min(roll24_vals)) / (rng_24 + 1e-6)
+    )
+    # v2: 2nd order differences
+    row["cost_delta_2h"]    = float(buf[-1] - buf[-3])  if len(buf) >= 3  else 0.0
+    row["cost_accel_1h"]    = float((buf[-1]-buf[-2]) - (buf[-2]-buf[-3])) if len(buf) >= 3 else 0.0
+    roll3_max = float(np.max(buf[-3:])) if len(buf) >= 3 else float(buf[-1])
+    row["lag_pct_of_3h_max"]= float(buf[-1]) / (roll3_max + 1e-6)
 
     h   = timestamp.hour
     dow = timestamp.weekday()
