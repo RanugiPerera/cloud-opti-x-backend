@@ -6,7 +6,6 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("alerts", __name__, url_prefix="/api")
 
-# In-memory dismissed alerts (resets on server restart — fine for demo)
 _dismissed: set = set()
 
 # Lazy service imports
