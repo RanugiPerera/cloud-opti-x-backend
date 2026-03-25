@@ -1,17 +1,6 @@
 """
 Integrated RL Training Script
-==============================
-Trains the DQN agent inside the ForecastDrivenCloudEnvironment,
-where every cost transition is driven by the XGBoost forecaster.
 
-Run order
----------
-1. python scripts/full_pipeline_v2.py       — train v2 XGBoost forecaster
-2. python scripts/train_rl_integrated.py    — train RL agent (this file)
-3. python scripts/forecast_demo.py          — generate demo charts
-
-What this demonstrates for your thesis
----------------------------------------
 The RL agent learns a policy over the XGBoost forecast horizon:
   - State includes the 1h/3h/6h cost forecast → agent plans ahead
   - Actions affect scale_factor and provider → directly drives cost

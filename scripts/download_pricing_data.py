@@ -18,7 +18,6 @@ print("=" * 60)
 
 # AZURE PRICING API
 def fetch_azure_prices(service_name, output_filename):
-    """Fetch Azure pricing for a specific service"""
     
     print(f"\n[Azure] Downloading {service_name} pricing...")
     
