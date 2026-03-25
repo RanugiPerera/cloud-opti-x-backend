@@ -68,7 +68,6 @@ def fetch_azure_prices(service_name, output_filename):
 
 # AWS PRICING API
 def fetch_aws_prices(service_code, output_filename):
-    """Fetch AWS pricing for a specific service"""
     
     print(f"\n[AWS] Downloading {service_code} pricing...")
     

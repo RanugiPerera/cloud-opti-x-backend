@@ -1,13 +1,3 @@
-"""
-Integrated RL Training Script
-
-The RL agent learns a policy over the XGBoost forecast horizon:
-  - State includes the 1h/3h/6h cost forecast → agent plans ahead
-  - Actions affect scale_factor and provider → directly drives cost
-  - Reward penalises cost, rewards anticipatory provider switching
-  - The two models are tightly coupled: XGBoost forecasts, RL decides
-"""
-
 import glob
 import logging
 import sys
@@ -24,18 +14,12 @@ PLOTS_DIR  = BASE_DIR / "data" / "processed"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Robust import: find rl_agent_integrated.py wherever it lives ─────────────
-# Searches these locations in order:
-#   1. project_root/models/
-#   2. same folder as this script  (scripts/)
-#   3. scripts/models/
-#   4. project root itself
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _candidates = [
-    BASE_DIR / "models",          # correct location
-    _SCRIPT_DIR,                  # scripts/
-    _SCRIPT_DIR / "models",       # scripts/models/  (where it currently is)
-    BASE_DIR,                     # project root
+    BASE_DIR / "models",          
+    _SCRIPT_DIR,                  
+    _SCRIPT_DIR / "models",       
+    BASE_DIR,                    
 ]
 for _p in _candidates:
     if (_p / "rl_agent_integrated.py").exists():
@@ -48,7 +32,7 @@ else:
 
 from rl_agent_integrated import DQNAgent, ForecastDrivenCloudEnvironment
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+#  Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -57,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rl_training")
 
-# ── Hyperparameters ───────────────────────────────────────────────────────────
+# Hyperparameters
 NUM_EPISODES       = 500
 EPISODE_LENGTH     = 48      # 48 hours per episode
 BATCH_SIZE         = 64
@@ -71,12 +55,7 @@ DEVICE             = "cpu"
 # ============================================================================
 
 def load_xgb_model() -> xgb.XGBRegressor:
-    """
-    Load the +1h q50 model from v2 pipeline (direct multi-horizon).
-    Falls back to v1 single model if v2 models are not found.
-    The +1h model is used for the RL environment because the agent
-    makes 1-step transitions — it needs 1-hour-ahead cost predictions.
-    """
+
     # v2: look for horizon-specific q50 model (point forecast)
     v2_files = sorted(glob.glob(str(MODELS_DIR / "xgb_h1h_q50_*.json")))
     if v2_files:
@@ -101,16 +80,10 @@ def load_xgb_model() -> xgb.XGBRegressor:
     return model
 
 
-# ============================================================================
 # STEP 2: Build cost history for environment initialisation
-# ============================================================================
 
 def build_cost_history(n: int = 2000) -> np.ndarray:
-    """
-    Reconstruct a realistic cost history using the same log-space model
-    as the training pipeline. This gives the RL environment a proper
-    cost buffer so lag features are well-initialised from episode start.
-    """
+
     rng      = np.random.default_rng(42)
     phi, sigma = 0.70, 0.06
 
@@ -134,9 +107,7 @@ def build_cost_history(n: int = 2000) -> np.ndarray:
     return np.clip(np.exp(log_cost), 0.05, None)
 
 
-# ============================================================================
 # STEP 3: Training loop
-# ============================================================================
 
 def train(
     agent: DQNAgent,
@@ -213,10 +184,7 @@ def train(
         success_count=success_count,
     )
 
-
-# ============================================================================
 # STEP 4: Evaluation
-# ============================================================================
 
 def evaluate(
     agent: DQNAgent,
@@ -274,9 +242,7 @@ def evaluate(
         logger.info(f"    {p:<6}: {cnt/total_provider*100:.1f}% of steps")
 
 
-# ============================================================================
 # STEP 5: Plot training curves
-# ============================================================================
 
 def plot_training(stats: dict, output_path: Path) -> None:
     rewards = stats["rewards"]
@@ -336,26 +302,24 @@ def plot_training(stats: dict, output_path: Path) -> None:
     logger.info(f"Training plot saved → {output_path}")
 
 
-# ============================================================================
 # MAIN
-# ============================================================================
 
 def main() -> int:
-    # ── Load XGBoost ──────────────────────────────────────────────────────────
+    #  Load XGBoost
     try:
         xgb_model = load_xgb_model()
     except (FileNotFoundError, RuntimeError) as e:
         logger.error(str(e))
         return 1
 
-    # ── Build cost history buffer ─────────────────────────────────────────────
+    #  Build cost history buffer 
     logger.info("Building cost history buffer (2000 hours)...")
     cost_history = build_cost_history(n=2000)
     logger.info(f"  Cost history: min=${cost_history.min():.3f}  "
                 f"max=${cost_history.max():.3f}  "
                 f"mean=${cost_history.mean():.3f}")
 
-    # ── Create environment and agent ──────────────────────────────────────────
+    #  Create environment and agent
     env   = ForecastDrivenCloudEnvironment(
         xgb_model      = xgb_model,
         cost_history   = cost_history,
@@ -373,19 +337,19 @@ def main() -> int:
         device        = DEVICE,
     )
 
-    # ── Train ─────────────────────────────────────────────────────────────────
+    #  Train
     stats = train(agent, env)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
+    #  Save
     agent.save(MODELS_DIR / "rl_agent_integrated.pth")
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
+    #  Plot
     plot_training(stats, PLOTS_DIR / "rl_training_integrated.png")
 
-    # ── Evaluate ──────────────────────────────────────────────────────────────
+    #  Evaluate
     evaluate(agent, env)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    #  Summary
     logger.info("\n" + "=" * 62)
     logger.info("  TRAINING COMPLETE")
     logger.info("=" * 62)

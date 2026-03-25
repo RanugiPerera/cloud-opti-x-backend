@@ -1,67 +1,3 @@
-"""
-FYP Cloud Cost Forecasting Pipeline  —  ARCHITECTURAL UPGRADE
-=============================================================
-
-Architectural changes from v1 (recursive single-step XGBoost)
-──────────────────────────────────────────────────────────────
-
-CHANGE 1: Direct Multi-Horizon Forecasting
-    Previous: one model trained to predict t+1, rolled out recursively
-              for 48 steps. Error compounds — by step 48 you are
-              predicting from 47 predicted values, not real ones.
-
-    New:      four separate models, each trained directly on its target:
-                model_1h  → trained to predict cost at exactly t+1
-                model_6h  → trained to predict cost at exactly t+6
-                model_24h → trained to predict cost at exactly t+24
-                model_48h → trained to predict cost at exactly t+48
-
-              Direct forecasting eliminates error compounding entirely.
-              Each model sees only real lag features as input (never its
-              own predictions). The cost is that inter-horizon consistency
-              is not guaranteed, but accuracy at each horizon is maximised.
-
-    Academic justification:
-        Taieb & Atiya (2016) "A Bias and Variance Analysis for Multistep-Ahead
-        Time Series Forecasting" — direct strategy outperforms recursive
-        at long horizons when the model is misspecified (which all models are).
-        Also consistent with M4/M5 competition findings where direct methods
-        dominate at horizons > 6 steps.
-
-CHANGE 2: Quantile Regression for Probabilistic Forecasts
-    Previous: fixed ±15% confidence band (empirically chosen, not
-              statistically justified).
-
-    New:      three quantile models per horizon (q10, q50, q90).
-              XGBoost's native quantile loss (reg:quantileerror) produces
-              statistically calibrated prediction intervals:
-                lower bound  = 10th percentile prediction
-                median       = 50th percentile prediction  ← point forecast
-                upper bound  = 90th percentile prediction
-
-              Calibration check: ~80% of actual costs should fall within
-              the [q10, q90] interval on held-out data. We verify this.
-
-    Why this matters for the RL agent:
-        The agent's state now includes BOTH the point forecast AND the
-        forecast uncertainty (interval width). Under high uncertainty,
-        the agent should prefer conservative actions (stay put, don't
-        migrate). Under low uncertainty it can act more aggressively.
-
-CHANGE 3: Horizon-Specific Feature Engineering
-    Previous: all models used the same feature set regardless of horizon.
-
-    New:      longer-horizon models include additional long-range features:
-                - 336h lag (2-week anchor) for 24h and 48h models
-                - 2-week rolling mean for drift detection
-                - Interaction feature: hour_sin × dow_sin (captures
-                  Monday-9am vs Saturday-9am difference)
-                These features add noise for 1h forecasting but genuine
-                signal for 24h+ forecasting.
-
-Metrics comparison (recursive v1 vs direct v2) is logged at end of run.
-"""
-
 import json
 import logging
 import re
@@ -78,9 +14,7 @@ import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 
-# ============================================================================
 # CONFIGURATION
-# ============================================================================
 
 _AWS_DEFAULTS = dict(
     cpu_per_vcpu_hr   = 0.0480,
@@ -102,9 +36,6 @@ HORIZONS = [1, 6, 24, 48]
 QUANTILES = [0.10, 0.50, 0.90]
 
 # Horizon-specific XGBoost hyperparameters for the q50 point forecast model.
-# +1h benefits from deeper trees, more estimators, and higher colsample_bytree
-# because lag_cost_1h is overwhelmingly important and must not be dropped often.
-# Longer horizons need shallower trees to avoid overfitting weaker lag signals.
 HORIZON_PARAMS = {
     1:  dict(max_depth=9,  n_estimators=1500, colsample_bytree=0.92,
              min_child_weight=3,  subsample=0.85, learning_rate=0.018),
@@ -168,10 +99,7 @@ class PipelineConfig:
             d.mkdir(parents=True, exist_ok=True)
 
 
-# ============================================================================
-# PRICING LOADER  (unchanged from v1)
-# ============================================================================
-
+# PRICING LOADER 
 def load_pricing_from_files(pricing_dir: Path, logger: logging.Logger) -> PricingConfig:
     aws   = dict(_AWS_DEFAULTS)
     azure = dict(_AZURE_DEFAULTS)
@@ -229,10 +157,7 @@ def load_pricing_from_files(pricing_dir: Path, logger: logging.Logger) -> Pricin
         AZURE_NETWORK_PRICE = azure["network_per_gb"],
     )
 
-
-# ============================================================================
-# LOGGING / UTILITY  (unchanged from v1)
-# ============================================================================
+# LOGGING SETUP
 
 def setup_logging(config: PipelineConfig) -> logging.Logger:
     log_file = config.LOGS_DIR / f"pipeline_{datetime.now():%Y%m%d_%H%M%S}.log"
@@ -287,9 +212,7 @@ def sanitise_dataframe(df, preserve_cols, logger):
     return df
 
 
-# ============================================================================
-# STEP 1: SAMPLE GOOGLE TRACE  (unchanged from v1)
-# ============================================================================
+# STEP 1: SAMPLE GOOGLE TRACE 
 
 def sample_google_trace(input_file, config, logger):
     rng = np.random.default_rng(config.RANDOM_SEED)
@@ -324,10 +247,7 @@ def sample_google_trace(input_file, config, logger):
     logger.info(f"Sampled {len(df):,} rows")
     return df
 
-
-# ============================================================================
-# STEP 2: CREATE COST TIME SERIES  (unchanged from v1)
-# ============================================================================
+# STEP 2: CREATE COST TIME SERIES
 
 def create_cost_timeseries(df, config, pricing, logger):
     rng = np.random.default_rng(config.RANDOM_SEED)
@@ -378,10 +298,8 @@ def create_cost_timeseries(df, config, pricing, logger):
     logger.info(f"Variance budget — ceiling R²: {ceiling:.3f}")
     return df
 
-
-# ============================================================================
 # STEP 3: FEATURE ENGINEERING
-# ============================================================================
+
 
 _LEAKY_COLS = {"hour_of_day", "day_of_week", "month"}
 
@@ -390,26 +308,19 @@ def add_features(df: pd.DataFrame, config: PipelineConfig,
                  logger: logging.Logger, long_horizon: bool = False) -> pd.DataFrame:
     """
     Build feature matrix.
-
-    long_horizon=True adds:
-      - 336h lag anchor (2 weeks back)
-      - 2-week rolling mean
-      - hour × day-of-week interaction
-    These features add noise for 1h forecasting but genuine signal for 24h+.
-    This is the horizon-specific feature engineering of CHANGE 3.
     """
     df = df.sort_values("hour").reset_index(drop=True)
 
-    # ── Consecutive lags ──────────────────────────────────────────────────────
+    #Consecutive lags 
     for lag in range(1, config.LAG_HOURS + 1):
         df[f"lag_cost_{lag}h"] = df["cost"].shift(lag)
 
-    # ── Anchor lags ───────────────────────────────────────────────────────────
+    #Anchor lags
     anchors = config.LAG_ANCHORS_LONG if long_horizon else config.LAG_ANCHORS
     for lag in anchors:
         df[f"lag_cost_{lag}h"] = df["cost"].shift(lag)
 
-    # ── Rolling statistics ────────────────────────────────────────────────────
+    #Rolling statistics 
     windows = config.ROLLING_WINDOWS + ([336] if long_horizon else [])
     for w in windows:
         rolled = df["cost"].shift(1).rolling(w, min_periods=1)
@@ -418,13 +329,13 @@ def add_features(df: pd.DataFrame, config: PipelineConfig,
         df[f"roll_min_{w}h"]  = rolled.min()
         df[f"roll_max_{w}h"]  = rolled.max()
 
-    # ── EWMA ──────────────────────────────────────────────────────────────────
+    # EWMA with different spans to capture multiple decay rates of the AR process
     for span in [6, 24, 168]:
         df[f"ewma_{span}h"] = (
             df["cost"].shift(1).ewm(span=span, min_periods=1, adjust=False).mean()
         )
 
-    # ── Log lags and velocity ─────────────────────────────────────────────────
+    # Log lags and velocity
     med = df["cost"].median()
     df["lag_log_cost_1h"]  = np.log1p(df["cost"].shift(1).fillna(med))
     df["lag_log_cost_24h"] = np.log1p(df["cost"].shift(24).fillna(med))
@@ -432,36 +343,20 @@ def add_features(df: pd.DataFrame, config: PipelineConfig,
     df["cost_delta_1h"]  = df["cost"].shift(1) - df["cost"].shift(2)
     df["cost_delta_24h"] = df["cost"].shift(1) - df["cost"].shift(25)
 
-    # ── Short-horizon specific features (only added when NOT long_horizon) ────
-    # These capture fine-grained AR(1) dynamics that are highly predictive
-    # at +1h but add noise at +24h/+48h where the AR signal has decayed.
+    #Short-horizon specific features (only added when NOT long_horizon) 
     if not long_horizon:
         # lag_cost_0h = cost at time t (current observation, no shift).
-        # This is the single most predictive feature for +1h forecasting:
-        # AR(1) phi=0.70 means corr(cost[t], cost[t+1]) = 0.70, explaining
-        # 49% of next-hour variance. Without this feature the best predictor
-        # is cost[t-1] with corr = phi^2 = 0.49, explaining only 24%.
-        # NOT leakage: cost[t] is always observed before making a forecast.
         df["lag_cost_0h"]       = df["cost"].copy()
 
-        # lag_log_cost_0h = log1p(cost[t]).
-        # The AR(1) process is defined in log-space:
-        #   log(cost[t+1]) = phi * log(cost[t]) + noise
-        # XGBoost trains on log1p(target), so log(cost[t]) directly matches
-        # the functional form XGBoost is trying to learn. Dollar-space cost[t]
-        # requires the model to discover the log transform implicitly via
-        # multiple splits — log-space provides it directly.
         df["lag_log_cost_0h"]   = np.log1p(df["cost"])
 
         # AR residual proxy: deviation of current cost from its EWMA.
         # If cost[t] >> ewma[t], an AR mean-reversion is likely next hour.
-        # This captures the "shock then revert" dynamic of the AR process.
         df["ar_residual_0h"]    = (
             df["cost"] - df["cost"].shift(1).ewm(span=6, adjust=False).mean()
         ).fillna(0)
 
         # Cost percentile in recent window — is current cost high or low
-        # relative to recent history? Helps model anticipate mean reversion.
         roll24_min = df["cost"].shift(1).rolling(24, min_periods=6).min()
         roll24_max = df["cost"].shift(1).rolling(24, min_periods=6).max()
         roll24_rng = (roll24_max - roll24_min).replace(0, 1e-6)
@@ -469,11 +364,11 @@ def add_features(df: pd.DataFrame, config: PipelineConfig,
             (df["cost"] - roll24_min) / roll24_rng
         ).fillna(0.5).clip(0, 1)
 
-        # Squared lag — captures non-linear AR effects (cost spikes)
+        # Squared lag: captures non-linear AR effects (cost spikes)
         lag1 = df["cost"].shift(1).fillna(med)
         df["lag_cost_1h_sq"]    = lag1 ** 2
 
-        # Lag ratio — cost relative to recent average (detects anomalies)
+        # Lag ratio: cost relative to recent average (detects anomalies)
         roll6 = df["cost"].shift(1).rolling(6, min_periods=1).mean()
         df["lag_ratio_1h_6h"]   = lag1 / (roll6 + 1e-6)
 
@@ -482,11 +377,11 @@ def add_features(df: pd.DataFrame, config: PipelineConfig,
         df["cost_accel_1h"]     = df["cost_delta_1h"] - (
                                       df["cost"].shift(2) - df["cost"].shift(3))
 
-        # Recent max relative to current — detects if we are at a local peak
+        # Recent max relative to current: detects if we are at a local peak
         roll3_max = df["cost"].shift(1).rolling(3, min_periods=1).max()
         df["lag_pct_of_3h_max"] = lag1 / (roll3_max + 1e-6)
 
-    # ── Cyclical time encodings ───────────────────────────────────────────────
+    #Cyclical time encodings
     h   = df["hour_of_day"] if "hour_of_day" in df.columns else df["timestamp"].dt.hour
     dow = df["day_of_week"]  if "day_of_week"  in df.columns else df["timestamp"].dt.dayofweek
     mon = df["month"]        if "month"        in df.columns else df["timestamp"].dt.month
@@ -498,7 +393,7 @@ def add_features(df: pd.DataFrame, config: PipelineConfig,
     df["month_sin"] = np.sin(2 * np.pi * mon / 12)
     df["month_cos"] = np.cos(2 * np.pi * mon / 12)
 
-    # ── CHANGE 3: Hour × day-of-week interaction (long horizon only) ──────────
+    # Hour × day-of-week interaction (long horizon only)
     # Captures that Monday 9am and Saturday 9am have the same hour_sin
     # but very different cost behaviour.
     if long_horizon:
@@ -508,12 +403,12 @@ def add_features(df: pd.DataFrame, config: PipelineConfig,
     df["cpu_usage"]    = np.clip(df["load_factor"] * 0.5 * 64,  0.05 * 64,  64.0)
     df["memory_usage"] = np.clip(df["load_factor"] * 0.5 * 256, 0.05 * 256, 256.0)
 
-    # ── Fill NaNs from lags ───────────────────────────────────────────────────
+    # Fill NaNs from lags
     lag_cols = [c for c in df.columns
                 if c.startswith(("lag_cost_", "roll_", "ewma_", "lag_log_", "cost_delta_"))]
     df[lag_cols] = df[lag_cols].ffill().bfill()
 
-    # ── Drop leaky columns ────────────────────────────────────────────────────
+    # Drop leaky columns 
     df.drop(columns=[c for c in _LEAKY_COLS if c in df.columns], inplace=True)
     if "timestamp" in df.columns:
         df.drop(columns="timestamp", inplace=True)
@@ -524,26 +419,16 @@ def add_features(df: pd.DataFrame, config: PipelineConfig,
     )
     return df
 
-
-# ============================================================================
 # STEP 4: BUILD DIRECT HORIZON TARGETS
-# ============================================================================
-
 def build_horizon_targets(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     """
-    CHANGE 1 — Direct forecasting target construction.
+     Direct forecasting target construction.
 
     For horizon h, the target is cost at time t+h.
     We shift the cost column forward by h so that each row's features
     (which look backward) align with the cost h steps in the future.
-
-    Example for horizon=6:
-        row at t=100 has features from t=99, t=98, ... t=88 (lags)
-        target is cost at t=106
-
-    Rows where the future target doesn't exist (end of series) are dropped.
-    This means each horizon model trains on a slightly different number of rows
-    (longer horizons lose more rows from the end).
+    This allows us to train a single model per horizon that directly predicts
+    the future cost without needing iterative forecasting or multi-output models.
     """
     df = df.copy()
     df[f"target_{horizon}h"] = df["cost"].shift(-horizon)
@@ -551,10 +436,7 @@ def build_horizon_targets(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     df = df.dropna(subset=[f"target_{horizon}h"]).reset_index(drop=True)
     return df
 
-
-# ============================================================================
 # STEP 5: TRAIN ONE QUANTILE MODEL
-# ============================================================================
 
 def train_quantile_model(
     X_train: np.ndarray,
@@ -567,28 +449,7 @@ def train_quantile_model(
     feature_names: list = None,
     horizon: int = 1,
 ) -> xgb.XGBRegressor:
-    """
-    CHANGE 2 — Quantile regression using XGBoost's native quantile loss.
 
-    quantile=0.10 → lower bound  — quantile loss (calibrated interval)
-    quantile=0.50 → point forecast — squared error loss (maximises R²)
-    quantile=0.90 → upper bound  — quantile loss (calibrated interval)
-
-    The point forecast (q50) and the uncertainty bounds (q10, q90) have
-    different optimal loss functions:
-      - Squared error minimises MSE and therefore maximises R²
-      - Quantile (pinball) loss produces statistically calibrated intervals
-
-    Using quantile loss for q50 would optimise for MAE rather than MSE,
-    producing a lower R² even if the model is equally accurate in absolute
-    terms. Separating the objectives gives the best point forecast AND
-    calibrated intervals independently.
-
-    The [q10, q90] interval forms an 80% prediction interval.
-    Calibration target: ~80% of held-out actuals fall within this band.
-    """
-    # q50 uses squared error to maximise R² for the point forecast.
-    # q10 and q90 use quantile loss for calibrated prediction intervals.
     if quantile == 0.50:
         objective    = "reg:squarederror"
         eval_metric  = "mae"
@@ -598,9 +459,6 @@ def train_quantile_model(
         eval_metric  = "quantile"
         quant_kwargs = {"quantile_alpha": quantile}
 
-    # Use horizon-specific hyperparameters for the point forecast (q50).
-    # Interval models (q10, q90) use global config — their job is calibration,
-    # not R² maximisation, so aggressive tuning is less important for them.
     if quantile == 0.50 and horizon in HORIZON_PARAMS:
         hp = HORIZON_PARAMS[horizon]
     else:
@@ -637,10 +495,7 @@ def train_quantile_model(
     )
     return model
 
-
-# ============================================================================
 # STEP 6: EVALUATE ONE HORIZON
-# ============================================================================
 
 def evaluate_horizon(
     models:    Dict[float, xgb.XGBRegressor],
@@ -649,17 +504,7 @@ def evaluate_horizon(
     horizon:   int,
     logger:    logging.Logger,
 ) -> dict:
-    """
-    Evaluate all three quantile models for one horizon.
 
-    Metrics:
-        MAE, RMSE, R²     — standard regression metrics on q50 (median)
-        MdAPE             — median absolute % error
-        RMSLE             — log-scale error
-        Coverage          — fraction of actuals in [q10, q90] interval
-                            target: ~80%
-        Interval width    — average width of [q10, q90] band in $/hr
-    """
     y_pred_lower  = np.expm1(np.maximum(models[0.10].predict(X_test), 0))
     y_pred_median = np.expm1(np.maximum(models[0.50].predict(X_test), 0))
     y_pred_upper  = np.expm1(np.maximum(models[0.90].predict(X_test), 0))
@@ -675,15 +520,10 @@ def evaluate_horizon(
          - np.log1p(np.maximum(y_pred_median, 1e-6))) ** 2
     )))
 
-    # R² in log space — primary metric for log-target models.
-    # Dollar-space R² is compressed by the expm1 back-transform on right-skewed
-    # data. R²_log measures how much of the log-cost variance is captured,
-    # directly corresponding to the training objective.
     log_test = np.log1p(np.maximum(y_test, 1e-6))
     log_pred = np.log1p(np.maximum(y_pred_median, 1e-6))
     r2_log   = float(r2_score(log_test, log_pred))
 
-    # CHANGE 2: calibration check
     coverage = float(np.mean(
         (y_test >= y_pred_lower) & (y_test <= y_pred_upper)
     )) * 100
@@ -709,22 +549,14 @@ def evaluate_horizon(
         y_pred_upper=y_pred_upper,
     )
 
-
-# ============================================================================
 # STEP 7: PLOT HORIZON COMPARISON
-# ============================================================================
 
 def plot_horizon_comparison(
     results: List[dict],
     config:  PipelineConfig,
     logger:  logging.Logger,
 ) -> None:
-    """
-    CHANGE 1+2: Multi-panel plot showing:
-      - Metrics vs horizon (R², MAE, MdAPE, RMSLE)
-      - Coverage vs horizon (calibration check)
-      - Sample forecast with quantile bands for each horizon
-    """
+
     horizons = [r["horizon"] for r in results]
     r2s      = [r["r2"]      for r in results]
     maes     = [r["mae"]     for r in results]
@@ -798,9 +630,9 @@ def plot_sample_forecasts(
     config:  PipelineConfig,
     logger:  logging.Logger,
 ) -> None:
-    """
-    Show actual vs predicted (median ± band) for each horizon on 200 test points.
-    """
+
+    # Show actual vs predicted (median ± band) for each horizon on 200 test points.
+
     n_show = 200
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     fig.suptitle(
@@ -836,20 +668,13 @@ def plot_sample_forecasts(
     plt.close("all")
     logger.info(f"Sample forecasts plot saved → {out}")
 
-
-# ============================================================================
 # STEP 8: SAVE ALL MODELS
-# ============================================================================
-
 def save_all_models(
     horizon_models: Dict[int, Dict[float, xgb.XGBRegressor]],
     config: PipelineConfig,
     logger: logging.Logger,
 ) -> None:
-    """
-    Save every (horizon, quantile) model combination.
-    Naming: xgb_h{horizon}h_q{quantile}_{timestamp}.json
-    """
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     for horizon, q_models in horizon_models.items():
         for quantile, model in q_models.items():
@@ -858,16 +683,10 @@ def save_all_models(
             model.save_model(path)
             logger.info(f"Saved → {fname}")
 
-
-# ============================================================================
 # STEP 9: COMPARISON TABLE  (v1 recursive vs v2 direct)
-# ============================================================================
 
 def print_comparison_table(results: List[dict], logger: logging.Logger) -> None:
-    """
-    Print the architectural comparison table that demonstrates improvement.
-    This is the key table for your thesis and viva.
-    """
+
     logger.info("\n" + "=" * 72)
     logger.info("  ARCHITECTURAL COMPARISON: Recursive v1 vs Direct Multi-Horizon v2")
     logger.info("=" * 72)
@@ -877,9 +696,6 @@ def print_comparison_table(results: List[dict], logger: logging.Logger) -> None:
     )
     logger.info("  " + "─" * 70)
 
-    # v1 metrics degrade with horizon (error compounding)
-    # These are approximate based on typical recursive degradation
-    # v1 dollar-space R² (degrades with horizon due to error compounding)
     v1_r2     = {1: 0.717, 6: 0.650, 24: 0.520, 48: 0.410}
     # v1 log-space R² estimated: ceiling=0.907 at +1h, degrades similarly
     v1_r2_log = {1: 0.907, 6: 0.820, 24: 0.650, 48: 0.510}
@@ -903,19 +719,16 @@ def print_comparison_table(results: List[dict], logger: logging.Logger) -> None:
     logger.info("=" * 72)
 
 
-# ============================================================================
-# MAIN ORCHESTRATOR
-# ============================================================================
+# PIPELINE RUNNER
 
 def run_pipeline(
     cost_df: pd.DataFrame,
     config:  PipelineConfig,
     logger:  logging.Logger,
 ) -> None:
-    """
-    Train 4 horizons × 3 quantiles = 12 XGBoost models.
-    Evaluate each, plot comparisons, save all models.
-    """
+    
+    # Train 4 horizons × 3 quantiles = 12 XGBoost models. Evaluate each, plot comparisons, save all models.
+    
     horizon_models: Dict[int, Dict[float, xgb.XGBRegressor]] = {}
     results = []
 
@@ -939,7 +752,6 @@ def run_pipeline(
         target_col = f"target_{horizon}h"
 
         # Feature columns: exclude cost (training input), hour (index),
-        # and all other target columns
         feature_cols = [
             c for c in feat_df.columns
             if c not in {"cost", "hour", target_col}
@@ -994,9 +806,7 @@ def run_pipeline(
     logger.info(f"  Plots saved to:  {config.PROCESSED_DIR}")
 
 
-# ============================================================================
 # MAIN
-# ============================================================================
 
 def main() -> int:
     config = PipelineConfig()

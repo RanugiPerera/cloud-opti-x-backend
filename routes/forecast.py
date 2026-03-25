@@ -51,7 +51,7 @@ def forecast_costs():
     if not data:
         return jsonify({"error": "Request body must be JSON"}), 400
 
-    # ── Validate inputs ───────────────────────────────────────────────────────
+    #  Validate inputs 
     cloud_provider = str(data.get("cloud_provider", "aws")).lower()
     service_type   = str(data.get("service_type",   "vm")).lower()
     forecast_hours = data.get("forecast_hours", 24)
@@ -71,7 +71,7 @@ def forecast_costs():
             "error": "forecast_hours must be an integer between 1 and 48"
         }), 400
 
-    # ── Run forecast ──────────────────────────────────────────────────────────
+    #  Run forecast 
     try:
         result = get_service().predict_costs(
             cloud_provider = cloud_provider,
@@ -81,7 +81,7 @@ def forecast_costs():
         logger.exception("Forecast failed")
         return jsonify({"error": str(exc)}), 500
 
-    # ── Format response ───────────────────────────────────────────────────────
+    #  Format response 
     predictions = []
     for i, (ts, cost) in enumerate(
         zip(result["timestamps"], result["costs"][:forecast_hours])
@@ -116,9 +116,8 @@ def forecast_costs():
     }), 200
 
 
-# ============================================================================
+
 # GET /api/forecast/compare
-# ============================================================================
 
 @bp.route("/forecast/compare", methods=["GET"])
 def compare_providers():
@@ -213,10 +212,6 @@ def test_forecast():
 
     try:
         svc = get_service()
-
-        # Lightweight check — just verify the model object is loaded.
-        # Do NOT run predict_costs() here — that triggers a full 48-hour
-        # forecast on every health check, wasting ~2s of CPU per call.
         booster = svc._model.get_booster()
         n_features = booster.num_features()
 
@@ -235,9 +230,7 @@ def test_forecast():
             "detail":  str(exc),
         }), 500
 
-# ============================================================================
-# FEATURE 1 — SHAP Explainability endpoints
-# ============================================================================
+# SHAP Explainability endpoints
 
 @bp.route("/forecast/explain", methods=["GET"])
 def explain_forecast():

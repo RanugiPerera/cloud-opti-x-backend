@@ -49,7 +49,6 @@ _SCALE_EFFECT = {
 
 
 class RLService:
-    """Wraps DQN agent for use by the Flask API."""
 
     def __init__(self):
         self._agent = None
@@ -58,7 +57,7 @@ class RLService:
         self._load()
 
     def _load(self):
-        # ── Load XGBoost ──────────────────────────────────────────────────────
+        #  Load XGBoost model
         xgb_files = sorted(glob.glob(str(MODELS_DIR / "xgb_cost_model_*.json")))
         if not xgb_files:
             raise FileNotFoundError(
@@ -68,7 +67,7 @@ class RLService:
         self._xgb.load_model(xgb_files[-1])
         logger.info(f"XGBoost loaded: {Path(xgb_files[-1]).name}")
 
-        # ── Load RL agent ─────────────────────────────────────────────────────
+        #  Load RL agent 
         rl_files = sorted(glob.glob(str(MODELS_DIR / "rl_agent_integrated.pth")))
         if not rl_files:
             raise FileNotFoundError(
@@ -82,7 +81,7 @@ class RLService:
         self._agent.epsilon = 0.0   # fully greedy — no random actions
         logger.info("DQN agent loaded (greedy mode)")
 
-        # ── Build cost history ────────────────────────────────────────────────
+        #  Build cost history 
         rng   = np.random.default_rng(42)
         n     = 200
         times = [datetime(2026, 1, 1) + timedelta(hours=i) for i in range(n)]
@@ -120,9 +119,7 @@ class RLService:
         provider:     str   = "aws",
         scale_factor: float = 1.0,
     ) -> dict:
-        """
-        Get a single action recommendation for the given state.
-        """
+        # Get a single action recommendation for the given state.
         env = self._make_env(provider)
 
         # Override env cost to match caller\'s reported current cost
@@ -169,9 +166,7 @@ class RLService:
         hours:             int = 24,
         starting_provider: str = "aws",
     ) -> dict:
-        """
-        Run agent for `hours` steps and return step-by-step decisions.
-        """
+   
         env   = self._make_env(starting_provider)
         state = env._build_state(env.current_cost, env._get_forecast())
 
@@ -259,6 +254,6 @@ class RLService:
                 "forecaster":              "XGBoost (R²=0.717, MdAPE=11.45%)",
                 "state_includes_forecast": True,
                 "forecast_horizon_hours":  6,
-                "cost_transitions":        "XGBoost-driven (not hardcoded)",
+                "cost_transitions":        "XGBoost-driven",
             },
         }

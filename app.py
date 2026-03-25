@@ -7,10 +7,6 @@ from routes.alerts import bp as alerts_bp
 
 app = Flask(__name__)
 
-# enable CORS for frontend
-# Explicit config required — bare CORS(app) doesn't include
-# Content-Type in Access-Control-Allow-Headers, which causes the
-# browser to block the GET after the OPTIONS preflight succeeds.
 CORS(app, resources={r"/api/*": {
     "origins":  "*",
     "methods":  ["GET", "POST", "OPTIONS"],
@@ -22,10 +18,6 @@ app.register_blueprint(forecast.bp)
 app.register_blueprint(rl.bp)
 app.register_blueprint(alerts_bp)
 
-# ── Eager model loading — synchronous, before Flask accepts requests ──────────
-# Models are loaded BEFORE socketio/app.run() so the server only starts
-# listening once both models are fully ready. Background threads caused
-# OS scheduling delays (3+ min) because they competed with Flask startup.
 print("Loading models — please wait...")
 
 with app.app_context():
