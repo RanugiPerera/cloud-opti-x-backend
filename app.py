@@ -18,24 +18,25 @@ app.register_blueprint(forecast.bp)
 app.register_blueprint(rl.bp)
 app.register_blueprint(alerts_bp)
 
-print("Loading models — please wait...")
-
-with app.app_context():
-    try:
-        from routes.forecast import get_service
-        get_service()
-        print("✓ ForecastService ready")
-    except Exception as e:
-        print(f"✗ ForecastService failed: {e}")
-
-    try:
-        from routes.rl import get_rl_service
-        get_rl_service()
-        print("✓ RLService ready")
-    except Exception as e:
-        print(f"✗ RLService failed: {e}")
-
 print("Models loaded — starting server...")
+
+import os
+if not os.environ.get("FLASK_TESTING"):
+    print("Loading models — please wait...")
+    with app.app_context():
+        try:
+            from routes.forecast import get_service
+            get_service()
+            print("✓ ForecastService ready")
+        except Exception as e:
+            print(f"✗ ForecastService failed: {e}")
+
+        try:
+            from routes.rl import get_rl_service
+            get_rl_service()
+            print("✓ RLService ready")
+        except Exception as e:
+            print(f"✗ RLService failed: {e}")
 
 
 # welcome endpoint
@@ -96,7 +97,6 @@ if __name__ == '__main__':
     print("  WS   /                          - Live streaming (HTTP polling, 30s interval)")
     print("=" * 60)
 
-    print("  Use 'python run.py' for WebSocket (eventlet) support")
     print("=" * 60)
     # REST API only when running app.py directly
     app.run(host='0.0.0.0', port=5000, debug=False)
