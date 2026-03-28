@@ -23,18 +23,6 @@ This repository contains the backend code for the Cloud Opti-X project, which ai
    npm install
    ```
 
-## Usage Examples
-- To start the backend server:
-  ```bash
-  npm start
-  ```
-- To optimize resources, use:
-  ```bash
-  npm run optimize
-  ```
-
-For further documentation, please refer to the Wiki section of this repository. 
-
 ---
 
 *Last updated: 2026-03-28 08:04:10 UTC*
