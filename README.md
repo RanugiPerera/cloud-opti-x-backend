@@ -109,8 +109,7 @@ The API is configured to accept cross-origin requests from all origins for `/api
 - If either model fails to load, an error message will be displayed but the server will continue running
 - Live streaming uses HTTP polling with a 30-second interval for real-time data updates
 
-## License
-See LICENSE file for details.
+
 
 ---
 
